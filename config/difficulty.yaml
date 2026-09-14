@@ -1,0 +1,21 @@
+profiles:
+  beginner:
+    perception: 0.35
+    reaction: 0.35
+    aim: 0.30
+    risk: 0.25
+  normal:
+    perception: 0.55
+    reaction: 0.55
+    aim: 0.50
+    risk: 0.45
+  high:
+    perception: 0.75
+    reaction: 0.75
+    aim: 0.72
+    risk: 0.65
+  pro:
+    perception: 0.95
+    reaction: 0.92
+    aim: 0.90
+    risk: 0.82

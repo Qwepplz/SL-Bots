@@ -1,0 +1,13 @@
+map: de_mirage
+server_tickrate: 128
+tactical_hz: 32
+action_hz: 128
+tactical_hidden_size: 256
+action_hidden_size: 128
+player_slots: 9
+sound_slots: 16
+event_slots: 16
+collision_rays: 40
+actor_observation_bytes: 256
+weapon_count: 16
+buy_action_count: 32

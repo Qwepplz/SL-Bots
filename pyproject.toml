@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sl-bots"
+version = "0.1.0"
+description = "CS:GO training and runtime framework"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pyarrow>=18,<22",
+    "pyyaml>=6,<7",
+]
+
+[project.scripts]
+sl-bots = "sl_bots.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sl_bots"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -17,3 +17,11 @@
 *.woff2 binary
 *.ttf binary
 *.eot binary
+*.dem binary
+*.smx binary
+*.onnx binary
+*.pt binary
+*.pth binary
+*.parquet binary
+*.arrow binary
+*.lib binary
