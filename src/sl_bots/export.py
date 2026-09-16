@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,114 @@ class ExportManifestV1:
         object.__setattr__(self, "metadata_path", Path(self.metadata_path))
         object.__setattr__(self, "purpose", ensure_purpose(self.purpose))
         object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True)
+class PolicyGenerationV1:
+    number: int
+    actor_checkpoint: Path
+    critic_checkpoint: Path
+    optimizer_checkpoint: Path
+    onnx_path: Path
+    behavior_sha256: str
+    parent_generation: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.number, int) or isinstance(self.number, bool) or self.number < 0:
+            raise ValueError("policy generation number must be a non-negative integer")
+        if self.number == 0 and self.parent_generation is not None:
+            raise ValueError("generation 0 cannot have a parent generation")
+        if self.number > 0 and self.parent_generation != self.number - 1:
+            raise ValueError("policy generation parent must be exactly number - 1")
+        for name in ("actor_checkpoint", "critic_checkpoint", "optimizer_checkpoint", "onnx_path"):
+            path = Path(getattr(self, name)).resolve()
+            if not path.name:
+                raise ValueError(f"{name} cannot be empty")
+            object.__setattr__(self, name, path)
+        behavior_sha256 = str(self.behavior_sha256).lower()
+        if len(behavior_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in behavior_sha256
+        ):
+            raise ValueError("behavior_sha256 must be a 64-character hexadecimal digest")
+        object.__setattr__(self, "behavior_sha256", behavior_sha256)
+
+    def assert_publishable(self) -> None:
+        for name in ("actor_checkpoint", "critic_checkpoint", "optimizer_checkpoint", "onnx_path"):
+            path = getattr(self, name)
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            if path.stat().st_size <= 0:
+                raise ValueError(f"policy generation artifact is empty: {path}")
+        actual = _sha256_file(self.onnx_path)
+        if actual != self.behavior_sha256:
+            raise ValueError("policy generation behavior hash does not match the ONNX artifact")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "policy-generation-v1",
+            "number": self.number,
+            "actor_checkpoint": str(self.actor_checkpoint),
+            "critic_checkpoint": str(self.critic_checkpoint),
+            "optimizer_checkpoint": str(self.optimizer_checkpoint),
+            "onnx_path": str(self.onnx_path),
+            "behavior_sha256": self.behavior_sha256,
+            "parent_generation": self.parent_generation,
+        }
+
+
+def publish_policy_generation(
+    generation: PolicyGenerationV1,
+    pointer_path: str | Path,
+) -> Path:
+    if not isinstance(generation, PolicyGenerationV1):
+        raise TypeError("generation must be PolicyGenerationV1")
+    generation.assert_publishable()
+    destination = Path(pointer_path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(generation.to_dict(), handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            descriptor = os.open(str(destination.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return destination
+
+
+def load_policy_generation(pointer_path: str | Path) -> PolicyGenerationV1:
+    path = Path(pointer_path).resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("policy generation pointer is not valid JSON") from error
+    if not isinstance(payload, Mapping) or payload.get("schema") != "policy-generation-v1":
+        raise ValueError("policy generation pointer schema is invalid")
+    generation = PolicyGenerationV1(
+        number=int(payload["number"]),
+        actor_checkpoint=Path(str(payload["actor_checkpoint"])),
+        critic_checkpoint=Path(str(payload["critic_checkpoint"])),
+        optimizer_checkpoint=Path(str(payload["optimizer_checkpoint"])),
+        onnx_path=Path(str(payload["onnx_path"])),
+        behavior_sha256=str(payload["behavior_sha256"]),
+        parent_generation=(
+            None if payload.get("parent_generation") is None else int(payload["parent_generation"])
+        ),
+    )
+    generation.assert_publishable()
+    return generation
 
 
 def _manifest_to_dict(manifest: DatasetManifestV1) -> dict[str, Any]:

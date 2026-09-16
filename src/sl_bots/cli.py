@@ -6,7 +6,11 @@ import argparse
 import copy
 import json
 import math
+import os
 from pathlib import Path
+import signal
+import sys
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -22,7 +26,10 @@ Command = tuple[str, ...]
 _COMMANDS: tuple[Command, ...] = (
     ("demo", "ingest"),
     ("train", "bc"),
+    ("train", "gail"),
     ("train", "selfplay"),
+    ("train", "farm"),
+    ("train", "pipeline"),
     ("export",),
     ("runtime", "serve"),
 )
@@ -55,6 +62,8 @@ def _add_leaf(
     parser.set_defaults(command_path=command)
     if command == ("demo", "ingest"):
         parser.add_argument("--input", type=Path, help="GOTV Demo 文件")
+        parser.add_argument("--input-root", type=Path, help="包含多个 GOTV Demo 的目录")
+        parser.add_argument("--expected-count", type=int, default=10)
         parser.add_argument(
             "--purpose",
             choices=[purpose.value for purpose in DataPurpose],
@@ -73,6 +82,28 @@ def _add_leaf(
             default=DataPurpose.TEST_ONLY.value,
         )
         parser.add_argument("--output-dir", type=Path)
+        parser.add_argument("--device")
+    elif command == ("train", "gail"):
+        parser.add_argument("--demo-path", type=Path)
+        parser.add_argument("--selfplay-path", type=Path)
+        parser.add_argument("--validation-demo-path", type=Path)
+        parser.add_argument("--validation-selfplay-path", type=Path)
+        parser.add_argument("--expert-manifest", "--demo-manifest", dest="expert_manifest", type=Path)
+        parser.add_argument("--bootstrap-manifest", type=Path)
+        parser.add_argument("--parent-manifest", action="append", type=Path, default=[])
+        parser.add_argument("--phase", choices=["warmup", "knife", "live"], default="live")
+        parser.add_argument("--steps", type=int, default=2000)
+        parser.add_argument("--batch-size", type=int, default=64)
+        parser.add_argument("--demo-ratio", type=float, default=0.5)
+        parser.add_argument("--learning-rate", type=float, default=0.001)
+        parser.add_argument("--seed", type=int, default=7)
+        parser.add_argument("--device", default="cuda")
+        parser.add_argument("--output-dir", type=Path)
+        parser.add_argument(
+            "--purpose",
+            choices=[purpose.value for purpose in DataPurpose],
+            default=DataPurpose.TEST_ONLY.value,
+        )
     elif command == ("train", "selfplay"):
         parser.add_argument("--model", type=Path)
         parser.add_argument("--checkpoint", type=Path)
@@ -96,6 +127,26 @@ def _add_leaf(
             "--purpose",
             choices=[purpose.value for purpose in DataPurpose],
             default=DataPurpose.TEST_ONLY.value,
+        )
+    elif command == ("train", "farm"):
+        parser.add_argument("--server-root", type=Path)
+        parser.add_argument("--output-root", type=Path)
+        parser.add_argument("--run-id")
+        parser.add_argument("--max-servers", type=int, default=4)
+        parser.add_argument("--dry-run", action="store_true")
+    elif command == ("train", "pipeline"):
+        parser.add_argument("--config", type=Path)
+        parser.add_argument("--demo-root", type=Path)
+        parser.add_argument("--extractor", type=Path)
+        parser.add_argument("--server-root", type=Path)
+        parser.add_argument("--duration-seconds", type=float)
+        parser.add_argument("--max-servers", type=int)
+        parser.add_argument("--run-id", default="gpu-training")
+        parser.add_argument("--resume", action="store_true")
+        parser.add_argument(
+            "--purpose",
+            choices=[DataPurpose.PRODUCTION.value],
+            default=DataPurpose.PRODUCTION.value,
         )
     elif command == ("export",):
         parser.add_argument("--checkpoint", type=Path)
@@ -131,7 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     train = top.add_parser("train", help="训练管线")
     train_sub = train.add_subparsers(dest="algorithm", required=True)
     _add_leaf(train_sub, ("train", "bc"))
+    _add_leaf(train_sub, ("train", "gail"))
     _add_leaf(train_sub, ("train", "selfplay"))
+    _add_leaf(train_sub, ("train", "farm"))
+    _add_leaf(train_sub, ("train", "pipeline"))
 
     _add_leaf(top, ("export",))
 
@@ -244,6 +298,8 @@ def _load_gail_discriminator(
     if not isinstance(checkpoint, Mapping):
         raise ValueError("GAIL checkpoint must contain a mapping payload")
     dataset_manifest = checkpoint.get("dataset_manifest")
+    if isinstance(dataset_manifest, Mapping):
+        dataset_manifest = _manifest_from_dict(dataset_manifest)
     if not isinstance(dataset_manifest, DatasetManifestV1):
         raise ProductionLineageError("GAIL checkpoint must contain an embedded DatasetManifestV1")
     if dataset_manifest.effective_purpose() is not expected_manifest.effective_purpose():
@@ -361,15 +417,31 @@ def _load_selfplay_constraints(
 
 
 def _run_demo_ingest(args: argparse.Namespace) -> int:
-    if args.input is None:
-        raise ValueError("--input is required for demo ingest")
-    manifest = ingest_demo(
-        args.input,
-        args.data_root,
-        ensure_purpose(args.purpose),
-        extractor_path=args.extractor,
-        allow_header_only=args.allow_header_only,
-    )
+    if args.input is not None and args.input_root is not None:
+        raise ValueError("--input and --input-root cannot be used together")
+    if args.input_root is not None:
+        from .training_dataset import ingest_demo_corpus
+
+        if args.extractor is None:
+            raise ValueError("--extractor is required for corpus ingest")
+        manifest = ingest_demo_corpus(
+            args.input_root,
+            args.data_root,
+            args.extractor,
+            ensure_purpose(args.purpose),
+            expected_count=args.expected_count,
+            allow_header_only=args.allow_header_only,
+        )
+    else:
+        if args.input is None:
+            raise ValueError("--input or --input-root is required for demo ingest")
+        manifest = ingest_demo(
+            args.input,
+            args.data_root,
+            ensure_purpose(args.purpose),
+            extractor_path=args.extractor,
+            allow_header_only=args.allow_header_only,
+        )
     payload = _manifest_to_dict(manifest)
     if args.manifest_output is not None:
         _write_json(args.manifest_output, payload)
@@ -386,7 +458,7 @@ def _run_bc(args: argparse.Namespace) -> int:
         config.setdefault("dataset_path", str(args.dataset_path))
     output_dir = args.output_dir or args.data_root / "training" / "bc"
     config.setdefault("output_dir", str(output_dir))
-    run = train_bc(config, dataset_manifest, output_dir=output_dir)
+    run = train_bc(config, dataset_manifest, output_dir=output_dir, device=args.device)
     print(json.dumps({
         "name": run.name,
         "purpose": run.purpose.value,
@@ -395,6 +467,91 @@ def _run_bc(args: argparse.Namespace) -> int:
         "loss_history": list(run.loss_history),
         "config_sha256": run.config_sha256,
     }, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _run_gail(args: argparse.Namespace) -> int:
+    from .training_gail import GailWindowPathStream, train_discriminator
+
+    if args.demo_path is None or args.selfplay_path is None:
+        raise ValueError("--demo-path and --selfplay-path are required for train gail")
+    if (args.validation_demo_path is None) != (args.validation_selfplay_path is None):
+        raise ValueError("validation demo and self-play paths must be provided together")
+    phase = {"warmup": Phase.WARMUP, "knife": Phase.KNIFE, "live": Phase.LIVE}[args.phase]
+    purpose = ensure_purpose(args.purpose)
+    parents: list[DatasetManifestV1] = []
+    manifest_paths = list(args.parent_manifest)
+    if args.expert_manifest is not None:
+        manifest_paths.append(args.expert_manifest)
+    if args.bootstrap_manifest is not None:
+        manifest_paths.append(args.bootstrap_manifest)
+    for path in manifest_paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        parents.append(_manifest_from_dict(json.loads(path.read_text(encoding="utf-8"))))
+    output_dir = args.output_dir or args.data_root / "training" / "gail"
+    demo_windows = GailWindowPathStream(
+        args.demo_path,
+        source="demo",
+        phase=phase,
+        window_length=128,
+    )
+    selfplay_windows = GailWindowPathStream(
+        args.selfplay_path,
+        source="selfplay",
+        phase=phase,
+        window_length=128,
+    )
+    validation_demo_windows = None
+    validation_selfplay_windows = None
+    if args.validation_demo_path is not None and args.validation_selfplay_path is not None:
+        validation_demo_windows = GailWindowPathStream(
+            args.validation_demo_path,
+            source="demo",
+            phase=phase,
+            window_length=128,
+        )
+        validation_selfplay_windows = GailWindowPathStream(
+            args.validation_selfplay_path,
+            source="selfplay",
+            phase=phase,
+            window_length=128,
+        )
+    run = train_discriminator(
+        demo_windows,
+        selfplay_windows,
+        phase=phase,
+        output_dir=output_dir,
+        purpose=purpose,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        demo_ratio=args.demo_ratio,
+        seed=args.seed,
+        parent_manifests=tuple(parents),
+        device=args.device,
+        learning_rate=args.learning_rate,
+        window_length=128,
+        validation_demo_windows=validation_demo_windows,
+        validation_selfplay_windows=validation_selfplay_windows,
+    )
+    payload = {
+        "name": run.name,
+        "purpose": run.purpose.value,
+        "dataset_manifest": _manifest_to_dict(run.dataset_manifest),
+        "steps": run.steps,
+        "loss_history": list(run.loss_history),
+        "validation_history": list(run.validation_history),
+        "checkpoint_path": run.checkpoint_path,
+        "config_sha256": run.config_sha256,
+        "device_type": run.device_type,
+        "device_index": run.device_index,
+        "device_name": run.device_name,
+        "torch_version": run.torch_version,
+        "hip_version": run.hip_version,
+        "metadata": dict(run.metadata),
+    }
+    _write_json(output_dir / "gail-manifest.json", payload)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -512,6 +669,133 @@ def _run_selfplay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_farm(args: argparse.Namespace) -> int:
+    from .server_farm import DedicatedServerFarm, build_server_specs
+
+    if args.server_root is None or args.output_root is None or args.run_id is None:
+        raise ValueError("--server-root, --output-root and --run-id are required for train farm")
+    specs = build_server_specs(
+        args.max_servers,
+        args.run_id,
+        args.server_root,
+        args.output_root,
+    )
+    farm = DedicatedServerFarm(
+        args.server_root,
+        args.output_root,
+        args.run_id,
+        max_servers=args.max_servers,
+    )
+    farm.start(specs, dry_run=args.dry_run)
+    if not args.dry_run:
+        farm.stop()
+    print(json.dumps({
+        "run_id": args.run_id,
+        "instances": [
+            {
+                "instance_id": spec.instance_id,
+                "ports": spec.ports,
+                "ipc_name": spec.ipc_name,
+                "get5_config_path": str(spec.get5_config_path),
+                "log_dir": str(spec.log_dir),
+            }
+            for spec in specs
+        ],
+        "dry_run": args.dry_run,
+    }, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _start_pipeline_interrupt_listener() -> threading.Event:
+    stop_event = threading.Event()
+    if os.environ.get("SL_BOTS_CONTROL_STDIN") != "1":
+        return stop_event
+
+    def listen() -> None:
+        while not stop_event.is_set():
+            line = sys.stdin.readline()
+            if not line:
+                return
+            if line.strip() == "SL_BOTS_CTRL_C":
+                signal.raise_signal(signal.SIGINT)
+                return
+
+    threading.Thread(
+        target=listen,
+        name="sl-bots-stdin-control",
+        daemon=True,
+    ).start()
+    return stop_event
+
+
+def _run_pipeline(args: argparse.Namespace) -> int:
+    from .training_pipeline import ProductionTrainingPipeline
+    from .training_orchestrator import TrainingOrchestrator
+
+    if args.demo_root is None or args.extractor is None or args.server_root is None:
+        raise ValueError("--demo-root, --extractor and --server-root are required for train pipeline")
+    config = args.config
+    if config is None:
+        config = Path(__file__).resolve().parents[2] / "config" / "training_gpu.yaml"
+    if not config.is_file():
+        raise FileNotFoundError(config)
+    interrupt_stop = threading.Event()
+    pipeline = None
+    orchestrator: TrainingOrchestrator | None = None
+    try:
+        interrupt_stop = _start_pipeline_interrupt_listener()
+        pipeline = ProductionTrainingPipeline(
+            config=config,
+            demo_root=args.demo_root,
+            data_root=args.data_root,
+            server_root=args.server_root,
+            max_servers=args.max_servers,
+            purpose=ensure_purpose(args.purpose),
+            run_id=args.run_id,
+            duration_seconds=args.duration_seconds,
+            extractor_path=args.extractor,
+        )
+        pipeline.training_device_probe()
+        pipeline.prepare(resume=args.resume)
+        orchestrator = TrainingOrchestrator(
+            config=config,
+            demo_root=args.demo_root,
+            data_root=args.data_root,
+            server_root=args.server_root,
+            max_servers=pipeline.max_servers,
+            purpose=ensure_purpose(args.purpose),
+            run_id=args.run_id,
+            duration_seconds=float(getattr(pipeline, "duration_seconds", 7200.0)),
+            calibration_probe=pipeline.calibration_probe,
+            bootstrap_runner=pipeline.bootstrap_runner,
+            wave_collector=pipeline.wave_collector,
+            wave_trainer=pipeline.wave_trainer,
+            generation_publisher=pipeline.generation_publisher,
+            match_loader=pipeline.match_loader,
+            stop_sampling=pipeline.stop_sampling,
+            truncation_flusher=pipeline.truncation_flusher,
+            instance_restarter=pipeline.instance_restarter,
+            worker_stop=pipeline.worker_stop,
+            runtime_stop=pipeline.runtime_stop,
+            server_stop=pipeline.server_stop,
+            farm=pipeline.farm,
+            parent_manifests=(pipeline.corpus_manifest,),
+            resume=args.resume,
+        )
+        orchestrator.run_preflight()
+        if not orchestrator.bootstrap_ready:
+            orchestrator.run_bootstrap()
+        orchestrator.run_timed_selfplay()
+    finally:
+        interrupt_stop.set()
+        if orchestrator is not None:
+            payload = orchestrator.finalize()
+    if orchestrator is None:
+        raise RuntimeError("training pipeline did not create its orchestrator")
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0 if payload["phase"] == "completed" else 1
+
+
 def _run_export(args: argparse.Namespace) -> int:
     from .export import export_actor
     from .training_bc import TrainingRunManifestV1
@@ -571,8 +855,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_demo_ingest(args)
         if command == ("train", "bc"):
             return _run_bc(args)
+        if command == ("train", "gail"):
+            return _run_gail(args)
         if command == ("train", "selfplay"):
             return _run_selfplay(args)
+        if command == ("train", "farm"):
+            return _run_farm(args)
+        if command == ("train", "pipeline"):
+            return _run_pipeline(args)
         if command == ("export",):
             return _run_export(args)
         if command == ("runtime", "serve"):

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .contracts import BotActionV1, DataPurpose, MAX_BOTS, Phase, Side, ensure_purpose
+from .get5_control import TrainingBoundaryV1
 from .lineage import DatasetManifestV1
 from .rewards import RewardLedger, RewardSignals, RewardWeights
 
@@ -120,6 +123,31 @@ class TrajectoryManifestV1:
         object.__setattr__(self, "phase", Phase(self.phase))
         object.__setattr__(self, "path", Path(self.path))
         object.__setattr__(self, "critic_path", Path(self.critic_path))
+
+
+@dataclass(frozen=True)
+class RolloutEnvelopeV1:
+    instance_id: str
+    match_id: str
+    policy_generation: int
+    phase: Phase
+    shard_path: Path
+    critic_path: Path
+    terminal: bool
+    truncated: bool
+
+    def __post_init__(self) -> None:
+        if not self.instance_id or not self.match_id:
+            raise ValueError("rollout envelope instance_id and match_id are required")
+        if self.policy_generation < 0:
+            raise ValueError("rollout envelope policy_generation must be non-negative")
+        if self.terminal and self.truncated:
+            raise ValueError("rollout envelope terminal and truncated cannot both be true")
+        object.__setattr__(self, "phase", Phase(self.phase))
+        object.__setattr__(self, "shard_path", Path(self.shard_path))
+        object.__setattr__(self, "critic_path", Path(self.critic_path))
+        if self.shard_path.name.endswith(".tmp") or self.critic_path.name.endswith(".tmp"):
+            raise ValueError("rollout envelope paths must be atomically completed files")
 
 
 class SelfPlayAdapter(Protocol):
@@ -442,6 +470,9 @@ class SelfPlayController:
         source_manifest: DatasetManifestV1 | None = None,
         adapter: SelfPlayAdapter | None = None,
         reward_weights: RewardWeights = RewardWeights(),
+        instance_id: str = "",
+        match_id: str = "",
+        policy_generation: int = 0,
     ) -> None:
         self.data_root = Path(data_root)
         self.purpose = ensure_purpose(purpose)
@@ -449,6 +480,11 @@ class SelfPlayController:
             raise TypeError("source_manifest must be DatasetManifestV1")
         self.source_manifest = source_manifest
         self.adapter = adapter
+        self.instance_id = str(instance_id)
+        self.match_id = str(match_id)
+        if policy_generation < 0:
+            raise ValueError("policy_generation must be non-negative")
+        self.policy_generation = int(policy_generation)
         self.reward_ledger = RewardLedger(reward_weights)
         self._status = "idle"
         self._phase: Phase | None = None
@@ -459,10 +495,13 @@ class SelfPlayController:
         self._batches: list[TransitionBatchV1] = []
         self._critic_snapshots: list[CriticSnapshotV1] = []
         self._completed_manifests: list[TrajectoryManifestV1] = []
-        self._completed_rollouts: list[tuple[TransitionBatchV1, ...]] = []
-        self._completed_critic_snapshots: list[tuple[CriticSnapshotV1, ...]] = []
+        self._completed_envelopes: list[RolloutEnvelopeV1] = []
+        self._pending_envelopes: list[RolloutEnvelopeV1] = []
+        self._rollout_shard_index = 0
+        self._next_hidden_reset = True
         self._boundaries: list[str] = []
         self._pause_reason = "technical"
+        self._training_allowed = True
 
     @property
     def status(self) -> str:
@@ -502,21 +541,21 @@ class SelfPlayController:
 
     @property
     def transitions(self) -> tuple[TransitionBatchV1, ...]:
-        segments = [*self._completed_rollouts]
+        segments = [self._load_completed(envelope).transitions for envelope in self._completed_envelopes]
         if self._batches:
             segments.append(tuple(self._batches))
         return tuple(batch for segment in segments for batch in segment)
 
     @property
     def rollout_segments(self) -> tuple[tuple[TransitionBatchV1, ...], ...]:
-        segments = list(self._completed_rollouts)
+        segments = [self._load_completed(envelope).transitions for envelope in self._completed_envelopes]
         if self._batches:
             segments.append(tuple(self._batches))
         return tuple(segments)
 
     @property
     def critic_snapshot_segments(self) -> tuple[tuple[CriticSnapshotV1, ...], ...]:
-        segments = list(self._completed_critic_snapshots)
+        segments = [self._load_completed(envelope).critic_snapshots for envelope in self._completed_envelopes]
         if self._critic_snapshots:
             segments.append(tuple(self._critic_snapshots))
         return tuple(segments)
@@ -524,6 +563,12 @@ class SelfPlayController:
     @property
     def completed_manifests(self) -> tuple[TrajectoryManifestV1, ...]:
         return tuple(self._completed_manifests)
+
+    @staticmethod
+    def _load_completed(envelope: RolloutEnvelopeV1) -> Any:
+        from .training_mappo import load_rollout_envelope
+
+        return load_rollout_envelope(envelope)
 
     def start_episode(
         self,
@@ -552,12 +597,349 @@ class SelfPlayController:
         self._bot_profiles = bot_profiles
         self._batches.clear()
         self._critic_snapshots.clear()
+        self._rollout_shard_index = 0
+        self._next_hidden_reset = True
         self._boundaries.clear()
         self._pause_reason = "technical"
+        self._training_allowed = True
         self.reward_ledger.reset()
         self._status = "running"
         if self.adapter is not None:
             self.adapter.start_episode(self._phase, normalized, self._epoch)
+
+    def apply_boundaries(self, boundaries: Sequence[TrainingBoundaryV1] = ()) -> None:
+        for boundary in boundaries:
+            self._apply_training_boundary(boundary)
+            if self._status == "finished":
+                return
+
+    def accept(
+        self,
+        observation: Any,
+        action: Any,
+        boundaries: Sequence[TrainingBoundaryV1] = (),
+    ) -> None:
+        self.apply_boundaries(boundaries)
+        if self._status == "finished":
+            return
+        if self._status == "paused" or not self._training_allowed:
+            return
+        if self._phase is None:
+            raise EpisodeNotRunning("no episode has been started")
+        observation_epoch = int(observation.epoch)
+        action_epoch = int(action.epoch)
+        if observation_epoch != action_epoch or observation_epoch != self._epoch:
+            raise ValueError(
+                f"self-play batch epoch mismatch: controller={self._epoch}, "
+                f"observation={observation_epoch}, action={action_epoch}"
+            )
+        if int(action.server_tick) != int(observation.server_tick):
+            raise ValueError("observation and action server ticks must match")
+        try:
+            observed_phase = Phase(int(observation.observations[0][5]))
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError("self-play observation does not contain a valid Get5 phase") from error
+        if observed_phase is not self.phase:
+            raise ValueError(
+                f"self-play phase mismatch: controller={self.phase.name.lower()}, "
+                f"observation={observed_phase.name.lower()}"
+            )
+        fallback_bots = {
+            bot_id
+            for bot_id, bot_action in zip(self.bot_ids, action.actions)
+            if bot_action.action_valid_mask == 0
+        }
+        self.step(
+            action.actions,
+            observations=observation.observations,
+            server_tick=int(observation.server_tick),
+            fallback_bots=fallback_bots,
+        )
+        if self._next_hidden_reset and self._batches:
+            self._reset_last_hidden_mask()
+            self._next_hidden_reset = False
+
+    def drain_completed(self, rollout_horizon: int = 1024) -> tuple[RolloutEnvelopeV1, ...]:
+        if not isinstance(rollout_horizon, int) or isinstance(rollout_horizon, bool) or rollout_horizon < 1:
+            raise ValueError("rollout_horizon must be a positive integer")
+        while len(self._batches) >= rollout_horizon:
+            self._flush_rollout_segment()
+        return self._drain_pending_envelopes()
+
+    def flush_pending(self, *, truncated: bool = False) -> tuple[RolloutEnvelopeV1, ...]:
+        if not isinstance(truncated, bool):
+            raise TypeError("truncated must be a boolean")
+        if self._batches:
+            self._flush_rollout_segment(truncated=truncated)
+        return self._drain_pending_envelopes()
+
+    def _apply_training_boundary(self, boundary: TrainingBoundaryV1) -> None:
+        if not isinstance(boundary, TrainingBoundaryV1):
+            raise TypeError("boundaries must contain TrainingBoundaryV1 values")
+        if boundary.epoch < 0 or boundary.server_tick < 0:
+            raise ValueError("training boundary epoch and server_tick must be non-negative")
+        kind = str(boundary.kind)
+        self._boundaries.append(kind)
+        if boundary.discard_uncommitted:
+            self._discard_current_rollout()
+        if kind in {"pause", "resume", "fallback"} and boundary.epoch != self._epoch:
+            raise ValueError(
+                f"training boundary epoch mismatch: controller={self._epoch}, boundary={boundary.epoch}"
+            )
+        if kind == "pause":
+            if self._batches:
+                self._flush_rollout_segment(boundary=True)
+            self._status = "paused"
+            self._training_allowed = False
+            self._next_hidden_reset = True
+            return
+        if kind == "resume":
+            if self._status == "paused":
+                self._status = "running"
+            self._training_allowed = bool(boundary.training_allowed)
+            self._next_hidden_reset = True
+            return
+        if kind == "backup_restore":
+            self._epoch = int(boundary.epoch)
+            self.reward_ledger.reset()
+            self._status = "running"
+            self._training_allowed = bool(boundary.training_allowed)
+            self._next_hidden_reset = True
+            return
+        if kind == "fallback":
+            self._status = "running"
+            self._training_allowed = False
+            self._next_hidden_reset = True
+            return
+        if boundary.epoch != self._epoch:
+            if kind in {"round_start", "map_end", "series_end"}:
+                if self._batches:
+                    self._flush_rollout_segment(
+                        terminal=kind in {"map_end", "series_end"},
+                        boundary=True,
+                    )
+                self._epoch = int(boundary.epoch)
+                self.reward_ledger.reset()
+            elif not self._batches and kind in {"rules_validated", "going_live", "live"}:
+                self._epoch = int(boundary.epoch)
+                self.reward_ledger.reset()
+            else:
+                raise ValueError(
+                    f"training boundary epoch mismatch: controller={self._epoch}, boundary={boundary.epoch}"
+                )
+        if kind in {"map_end", "series_end"} or boundary.terminal:
+            if self._batches:
+                self._flush_rollout_segment(terminal=True, boundary=True)
+            self._status = "finished"
+            self._training_allowed = False
+            self._next_hidden_reset = True
+            return
+        if kind in {"round_end", "halftime", "overtime_start", "round_start"} or boundary.reset_hidden:
+            if self._batches:
+                self._flush_rollout_segment(boundary=True)
+            self._next_hidden_reset = True
+        self._training_allowed = bool(boundary.training_allowed)
+
+    def _drain_pending_envelopes(self) -> tuple[RolloutEnvelopeV1, ...]:
+        envelopes = tuple(self._pending_envelopes)
+        self._pending_envelopes.clear()
+        return envelopes
+
+    def _flush_rollout_segment(
+        self,
+        *,
+        terminal: bool = False,
+        truncated: bool = False,
+        boundary: bool = False,
+    ) -> TrajectoryManifestV1 | None:
+        if terminal and truncated:
+            raise ValueError("rollout segment terminal and truncated cannot both be true")
+        if not self._batches:
+            return None
+        if self._phase is None:
+            raise EpisodeNotRunning("no episode has been started")
+        if boundary:
+            self._close_segment_at_boundary()
+        phase_name = self._phase.name.lower()
+        phase_root = self.data_root / "trajectories" / phase_name
+        critic_root = self.data_root / "critics" / phase_name
+        shard_id = f"{self._episode_id}.shard-{self._rollout_shard_index:06d}"
+        path = phase_root / f"{shard_id}.parquet"
+        critic_path = critic_root / f"{shard_id}.parquet"
+        trajectory_manifest_path = path.with_name(f"{path.stem}.manifest.json")
+        critic_manifest_path = critic_path.with_name(f"{critic_path.stem}.manifest.json")
+        metadata = {
+            "schema": TRAJECTORY_SCHEMA_VERSION,
+            "phase": phase_name,
+            "episode_id": self._episode_id,
+            "instance_id": self.instance_id or "default",
+            "match_id": self.match_id or self._episode_id,
+            "policy_generation": str(self.policy_generation),
+            "shard_index": str(self._rollout_shard_index),
+            "terminal": str(bool(terminal)).lower(),
+            "truncated": str(bool(truncated)).lower(),
+            "actor_critic_separate": "true",
+        }
+        parents = () if self.source_manifest is None else (self.source_manifest,)
+        created: list[Path] = []
+        try:
+            self._atomic_write(
+                path,
+                lambda temporary: self._write_trajectory(temporary, metadata=metadata),
+            )
+            created.append(path)
+            self._atomic_write(
+                critic_path,
+                lambda temporary: self._write_critic(temporary, metadata=metadata),
+            )
+            created.append(critic_path)
+            shard_sha256 = self._sha256_file(path)
+            critic_sha256 = self._sha256_file(critic_path)
+            dataset = DatasetManifestV1(
+                name=f"trajectory:{shard_id}",
+                purpose=self.purpose,
+                parents=parents,
+                artifact_type="trajectory",
+                metadata={**metadata, "shard_sha256": shard_sha256},
+            )
+            critic_dataset = DatasetManifestV1(
+                name=f"critic:{shard_id}",
+                purpose=self.purpose,
+                parents=parents,
+                artifact_type="critic_trajectory",
+                metadata={**metadata, "critic_sha256": critic_sha256, "actor_observations": "excluded"},
+            )
+            manifest = TrajectoryManifestV1(
+                episode_id=shard_id,
+                phase=self._phase,
+                path=path,
+                critic_path=critic_path,
+                dataset=dataset,
+                critic_dataset=critic_dataset,
+                transition_count=sum(len(batch.bot_ids) for batch in self._batches),
+            )
+            self._atomic_write_json(trajectory_manifest_path, self._manifest_payload(dataset))
+            created.append(trajectory_manifest_path)
+            self._atomic_write_json(critic_manifest_path, self._manifest_payload(critic_dataset))
+            created.append(critic_manifest_path)
+        except Exception:
+            for created_path in created:
+                try:
+                    created_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._remove_empty_directories(phase_root)
+            self._remove_empty_directories(critic_root)
+            raise
+        envelope = RolloutEnvelopeV1(
+            instance_id=self.instance_id or "default",
+            match_id=self.match_id or self._episode_id,
+            policy_generation=self.policy_generation,
+            phase=self._phase,
+            shard_path=path,
+            critic_path=critic_path,
+            terminal=bool(terminal),
+            truncated=bool(truncated),
+        )
+        self._completed_manifests.append(manifest)
+        self._completed_envelopes.append(envelope)
+        self._pending_envelopes.append(envelope)
+        self._batches.clear()
+        self._critic_snapshots.clear()
+        self._rollout_shard_index += 1
+        self._next_hidden_reset = True
+        if terminal:
+            self._status = "finished"
+            self._training_allowed = False
+        return manifest
+
+    def _discard_current_rollout(self) -> None:
+        self._batches.clear()
+        self._critic_snapshots.clear()
+        self.reward_ledger.reset()
+        self._next_hidden_reset = True
+
+    def _reset_last_hidden_mask(self) -> None:
+        if not self._batches:
+            return
+        last = self._batches[-1]
+        self._batches[-1] = replace(
+            last,
+            hidden_state_mask=tuple(False for _ in last.hidden_state_mask),
+        )
+
+    @staticmethod
+    def _manifest_payload(manifest: DatasetManifestV1) -> dict[str, Any]:
+        return {
+            "schema": "dataset-manifest-v1",
+            "name": manifest.name,
+            "purpose": manifest.purpose.value,
+            "artifact_type": manifest.artifact_type,
+            "source_sha256": manifest.source_sha256,
+            "parser_version": manifest.parser_version,
+            "projection_version": manifest.projection_version,
+            "parents": [SelfPlayController._manifest_payload(parent) for parent in manifest.parents],
+            "metadata": {str(key): str(value) for key, value in manifest.metadata.items()},
+        }
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _atomic_write(path: Path, writer: Callable[[Path], None]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise FileExistsError(f"refusing to overwrite completed rollout artifact: {path}")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            writer(temporary)
+            with temporary.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            SelfPlayController._fsync_directory(path.parent)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+        def write_json(temporary: Path) -> None:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+
+        SelfPlayController._atomic_write(path, write_json)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            return
+        try:
+            descriptor = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _remove_empty_directories(self, directory: Path) -> None:
+        current = Path(directory)
+        while current != self.data_root and current != current.parent:
+            try:
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
 
     def step(
         self,
@@ -641,6 +1023,9 @@ class SelfPlayController:
             observation_metadata={"schema": TRAJECTORY_SCHEMA_VERSION, "phase": self.phase.name.lower()},
         )
         self._batches.append(batch)
+        if self._next_hidden_reset:
+            self._reset_last_hidden_mask()
+            self._next_hidden_reset = False
         if critic_snapshot is not None:
             snapshot = (
                 critic_snapshot
@@ -739,6 +1124,13 @@ class SelfPlayController:
             "boundaries": ",".join(self._boundaries),
             "actor_critic_separate": "true",
         }
+        shard_sha256 = self._sha256_file(path)
+        critic_sha256 = self._sha256_file(critic_path)
+        metadata["shard_sha256"] = shard_sha256
+        critic_metadata = {
+            key: value for key, value in metadata.items() if key != "shard_sha256"
+        }
+        critic_metadata.update({"critic_sha256": critic_sha256, "actor_observations": "excluded"})
         dataset = DatasetManifestV1(
             name=f"trajectory:{self._episode_id}",
             purpose=self.purpose,
@@ -751,8 +1143,10 @@ class SelfPlayController:
             purpose=self.purpose,
             parents=parents,
             artifact_type="critic_trajectory",
-            metadata={**metadata, "actor_observations": "excluded"},
+            metadata=critic_metadata,
         )
+        self._atomic_write_json(path.with_name(f"{path.stem}.manifest.json"), self._manifest_payload(dataset))
+        self._atomic_write_json(critic_path.with_name(f"{critic_path.stem}.manifest.json"), self._manifest_payload(critic_dataset))
         manifest = TrajectoryManifestV1(
             episode_id=self._episode_id,
             phase=self._phase,
@@ -762,9 +1156,19 @@ class SelfPlayController:
             critic_dataset=critic_dataset,
             transition_count=sum(len(batch.bot_ids) for batch in self._batches),
         )
+        envelope = RolloutEnvelopeV1(
+            instance_id=self.instance_id or "default",
+            match_id=self.match_id or self._episode_id,
+            policy_generation=self.policy_generation,
+            phase=self._phase,
+            shard_path=path,
+            critic_path=critic_path,
+            terminal=True,
+            truncated=False,
+        )
         self._completed_manifests.append(manifest)
-        self._completed_rollouts.append(tuple(self._batches))
-        self._completed_critic_snapshots.append(tuple(self._critic_snapshots))
+        self._completed_envelopes.append(envelope)
+        self._pending_envelopes.append(envelope)
         self._batches.clear()
         self._critic_snapshots.clear()
         self._status = "finished"
@@ -842,7 +1246,7 @@ class SelfPlayController:
             return bool(done.get(bot_id, False))
         return bool(done)
 
-    def _write_trajectory(self, path: Path) -> None:
+    def _write_trajectory(self, path: Path, *, metadata: Mapping[str, str] | None = None) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -851,6 +1255,14 @@ class SelfPlayController:
             for batch in self._batches
             for index in range(len(batch.bot_ids))
         ]
+        table_metadata = {
+            b"schema": TRAJECTORY_SCHEMA_VERSION.encode(),
+            b"actor_observation_excludes_critic": b"true",
+        }
+        if metadata:
+            table_metadata.update(
+                {str(key).encode(): str(value).encode() for key, value in metadata.items()}
+            )
         table = pa.table(
             {
                 "episode_id": [self._episode_id for _, _ in rows],
@@ -865,17 +1277,19 @@ class SelfPlayController:
                 "state_fault": [batch.state_faults[index] for batch, index in rows],
                 "hidden_state_mask": [batch.hidden_state_mask[index] for batch, index in rows],
             },
-            metadata={
-                b"schema": TRAJECTORY_SCHEMA_VERSION.encode(),
-                b"actor_observation_excludes_critic": b"true",
-            },
+            metadata=table_metadata,
         )
         pq.write_table(table, path, compression="zstd")
 
-    def _write_critic(self, path: Path) -> None:
+    def _write_critic(self, path: Path, *, metadata: Mapping[str, str] | None = None) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
+        table_metadata = {b"schema": b"critic-trajectory-v1", b"actor_observations": b"excluded"}
+        if metadata:
+            table_metadata.update(
+                {str(key).encode(): str(value).encode() for key, value in metadata.items()}
+            )
         table = pa.table(
             {
                 "episode_id": [self._episode_id for snapshot in self._critic_snapshots],
@@ -886,6 +1300,6 @@ class SelfPlayController:
                     for snapshot in self._critic_snapshots
                 ],
             },
-            metadata={b"schema": b"critic-trajectory-v1", b"actor_observations": b"excluded"},
+            metadata=table_metadata,
         )
         pq.write_table(table, path, compression="zstd")

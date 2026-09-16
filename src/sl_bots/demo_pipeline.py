@@ -45,6 +45,29 @@ class DemoHeaderV1:
 
 
 @dataclass(frozen=True)
+class DemoCorpusEntryV1:
+    path: Path
+    header: DemoHeaderV1
+    sha256: str
+
+    def __post_init__(self) -> None:
+        path = Path(self.path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if len(self.sha256) != 64:
+            raise ValueError("demo sha256 must be a 64-character hex digest")
+        object.__setattr__(self, "path", path)
+
+    @property
+    def absolute_path(self) -> Path:
+        return self.path
+
+    @property
+    def source_sha256(self) -> str:
+        return self.sha256
+
+
+@dataclass(frozen=True)
 class RawTickV1:
     server_tick: int
     demo_time_s: float
@@ -229,6 +252,20 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def discover_demo_headers(input_root: str | Path) -> tuple[DemoCorpusEntryV1, ...]:
+    root = Path(input_root).resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+    entries: list[DemoCorpusEntryV1] = []
+    for path in sorted(
+        (candidate for candidate in root.rglob("*") if candidate.is_file() and candidate.suffix.lower() == ".dem"),
+        key=lambda candidate: str(candidate).lower(),
+    ):
+        header = read_demo_header(path)
+        entries.append(DemoCorpusEntryV1(path=path, header=header, sha256=_sha256(path)))
+    return tuple(entries)
 
 
 def ingest_demo(

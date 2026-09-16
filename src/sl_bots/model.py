@@ -144,8 +144,18 @@ if nn is not None:
         action_hidden_size = 128
         observation_size = OBSERVATION_RECORD_SIZE
 
-        def __init__(self, *, condition_size: int = 8, weapon_count: int = 16, buy_count: int = 32) -> None:
+        def __init__(
+            self,
+            *,
+            condition_size: int = 8,
+            weapon_count: int = 16,
+            buy_count: int = 32,
+            max_batch_size: int = 32,
+        ) -> None:
             super().__init__()
+            if not isinstance(max_batch_size, int) or not 1 <= max_batch_size:
+                raise ValueError("max_batch_size must be a positive integer")
+            self.max_batch_size = max_batch_size
             self.weapon_count = weapon_count
             self.buy_count = buy_count
             self.self_encoder = nn.Sequential(nn.Linear(20, 64), nn.LayerNorm(64), nn.GELU())
@@ -182,8 +192,8 @@ if nn is not None:
 
         def initial_state(self, batch_size: int, *, device: Any | None = None) -> RecurrentStateV1:
             _torch_required()
-            if not isinstance(batch_size, int) or not 1 <= batch_size <= 10:
-                raise ValueError("batch_size must be between 1 and 10")
+            if not isinstance(batch_size, int) or not 1 <= batch_size <= self.max_batch_size:
+                raise ValueError(f"batch_size must be between 1 and {self.max_batch_size}")
             if device is None:
                 device = next(self.parameters()).device
             return RecurrentStateV1(
@@ -195,8 +205,8 @@ if nn is not None:
         def _encode(self, observation: Any) -> tuple[Any, Any]:
             values = _payload_batch(observation, next(self.parameters()).device)
             batch_size = values.shape[0]
-            if batch_size > 10:
-                raise ValueError("batch size cannot exceed 10 bot slots")
+            if batch_size > self.max_batch_size:
+                raise ValueError(f"batch size cannot exceed {self.max_batch_size}")
             self_features = self.self_encoder(values[:, 8:28])
             player_values = values[:, 44:152].reshape(batch_size, 9, 12)
             player_tokens = self.player_encoder(player_values)

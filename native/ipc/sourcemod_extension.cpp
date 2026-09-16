@@ -6,6 +6,8 @@ extern "C" {
 int SLBots_Open(const char* name, std::uint32_t epoch, std::uint32_t capacity) noexcept;
 int SLBots_PublishObservation(const void* packet) noexcept;
 int SLBots_TryReadAction(void* packet) noexcept;
+int SLBots_PublishControl(const void* packet) noexcept;
+int SLBots_TryReadControl(void* packet) noexcept;
 std::uint32_t SLBots_GetHeartbeat() noexcept;
 int SLBots_SwitchEpoch(std::uint32_t epoch) noexcept;
 void SLBots_Abort() noexcept;
@@ -45,6 +47,26 @@ cell_t NativeSLBotsTryReadAction(
     return SLBots_TryReadAction(packet);
 }
 
+cell_t NativeSLBotsPublishControl(
+    SourcePawn::IPluginContext* context,
+    const cell_t* params) {
+    cell_t* packet = nullptr;
+    if (context->LocalToPhysAddr(params[1], &packet) != SP_ERROR_NONE) {
+        return context->ThrowNativeError("packet is not a valid array");
+    }
+    return SLBots_PublishControl(packet);
+}
+
+cell_t NativeSLBotsTryReadControl(
+    SourcePawn::IPluginContext* context,
+    const cell_t* params) {
+    cell_t* packet = nullptr;
+    if (context->LocalToPhysAddr(params[1], &packet) != SP_ERROR_NONE) {
+        return context->ThrowNativeError("packet is not a valid array");
+    }
+    return SLBots_TryReadControl(packet);
+}
+
 cell_t NativeSLBotsGetHeartbeat(SourcePawn::IPluginContext*, const cell_t*) {
     return static_cast<cell_t>(SLBots_GetHeartbeat());
 }
@@ -67,6 +89,8 @@ const sp_nativeinfo_t g_SLBotsNatives[] = {
     {"SLBots_Open", NativeSLBotsOpen},
     {"SLBots_PublishObservation", NativeSLBotsPublishObservation},
     {"SLBots_TryReadAction", NativeSLBotsTryReadAction},
+    {"SLBots_PublishControl", NativeSLBotsPublishControl},
+    {"SLBots_TryReadControl", NativeSLBotsTryReadControl},
     {"SLBots_GetHeartbeat", NativeSLBotsGetHeartbeat},
     {"SLBots_SwitchEpoch", NativeSLBotsSwitchEpoch},
     {"SLBots_Abort", NativeSLBotsAbort},

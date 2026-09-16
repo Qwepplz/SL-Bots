@@ -14,6 +14,8 @@ from typing import Any
 from .contracts import DataPurpose, ensure_purpose
 from .lineage import DatasetManifestV1, ProductionLineageError
 from .model import MirageActor
+from .training_dataset import RecurrentMiniBatchV1, iter_recurrent_minibatches, sequence_paths
+from .training_device import TrainingDeviceReportV1, resolve_training_device
 
 
 def _load_yaml(path: str | Path) -> Mapping[str, Any]:
@@ -65,94 +67,137 @@ class TrainingRunManifestV1:
             )
 
 
-def _column(table: Any, name: str) -> list[Any]:
-    return table.column(name).to_pylist()
+def _sequence_paths_for_manifest(
+    dataset_manifest: DatasetManifestV1,
+    config: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    configured_path = config.get("dataset_path")
+    if configured_path:
+        return (Path(str(configured_path)).resolve(),)
+    train_paths = sequence_paths(dataset_manifest, "train")
+    if train_paths:
+        return train_paths
+    manifest_path = dataset_manifest.metadata.get("path")
+    if manifest_path:
+        return (Path(manifest_path).resolve(),)
+    raise ValueError("dataset manifest does not declare training sequence paths")
 
 
-def _load_dataset(dataset_manifest: DatasetManifestV1, config: Mapping[str, Any]) -> dict[str, list[Any]]:
+def _validation_paths_for_manifest(dataset_manifest: DatasetManifestV1) -> tuple[Path, ...]:
+    return sequence_paths(dataset_manifest, "validation")
+
+
+def _validate_sequence_purpose(paths: Sequence[Path], expected: DataPurpose) -> None:
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
         raise RuntimeError("pyarrow is required for BC training") from error
-    dataset_path = config.get("dataset_path") or dataset_manifest.metadata.get("path")
-    if not dataset_path:
-        raise ValueError("dataset_path is required in config or dataset manifest")
-    table = pq.read_table(dataset_path)
-    metadata = table.schema.metadata or {}
-    encoded_purpose = metadata.get(b"purpose")
-    if encoded_purpose is None:
-        raise ValueError("dataset Parquet metadata must declare purpose")
-    try:
-        actual_purpose = encoded_purpose.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("dataset Parquet purpose metadata must be UTF-8") from error
-    expected_purpose = dataset_manifest.effective_purpose().value
-    if actual_purpose != expected_purpose:
-        raise ProductionLineageError(
-            f"dataset purpose {actual_purpose!r} does not match manifest purpose {expected_purpose!r}"
-        )
-    required = (
-        "observation",
-        "target_tick",
-        "forward",
-        "side",
-        "up",
-        "yaw_delta_deg",
-        "pitch_delta_deg",
-        "buttons",
-        "weapon_select",
-        "buy_action",
-        "loss_mask",
-    )
-    missing = [name for name in required if name not in table.column_names]
-    if missing:
-        raise ValueError(f"dataset is missing columns: {', '.join(missing)}")
-    result = {name: _column(table, name) for name in required}
-    if "sequence_id" in table.column_names:
-        result["sequence_id"] = _column(table, "sequence_id")
-    else:
-        result["sequence_id"] = ["sequence-0"] * len(result["observation"])
-    if "duration_s" in table.column_names:
-        result["duration_s"] = _column(table, "duration_s")
-    else:
-        result["duration_s"] = [1.0 / 128.0] * len(result["observation"])
-    if not result["observation"]:
-        raise ValueError("dataset must contain at least one sequence row")
-    return result
+    for path in paths:
+        parquet_file = pq.ParquetFile(str(path))
+        metadata = parquet_file.schema_arrow.metadata or {}
+        value = metadata.get(b"purpose")
+        if value is None:
+            raise ValueError(f"sequence shard {path} must declare purpose")
+        try:
+            actual = value.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"sequence shard {path} purpose must be UTF-8") from error
+        if actual != expected.value:
+            raise ProductionLineageError(
+                f"dataset purpose {actual!r} does not match manifest purpose {expected.value!r}"
+            )
 
 
-def _button_targets(values: Sequence[int], torch: Any) -> Any:
-    targets = []
-    for value in values:
-        targets.append([(int(value) >> bit) & 1 for bit in range(32)])
-    return torch.tensor(targets, dtype=torch.float32)
+def _load_dataset(
+    dataset_manifest: DatasetManifestV1,
+    config: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    """解析并校验 shard 路径；数据行仍由流式迭代器按窗口读取。"""
+    if not isinstance(dataset_manifest, DatasetManifestV1):
+        raise TypeError("dataset_manifest must be a DatasetManifestV1")
+    if not isinstance(config, Mapping):
+        raise TypeError("config must be a mapping")
+    purpose = dataset_manifest.effective_purpose()
+    paths = _sequence_paths_for_manifest(dataset_manifest, config)
+    _validate_sequence_purpose(paths, purpose)
+    return paths
 
 
-def _masked_mean(value: Any, mask: Any, torch: Any) -> Any:
-    denominator = mask.sum().clamp_min(1.0)
-    return (value * mask).sum() / denominator
-
-
-def _detach_recurrent_state(state: Any) -> Any:
+def _reset_state(state: Any, keep: Any, torch: Any) -> Any:
+    keep = keep.to(dtype=torch.bool)
+    zeros_tactical = torch.zeros_like(state.tactical)
+    zeros_action = torch.zeros_like(state.action)
+    zeros_tick = torch.zeros_like(state.tick)
     return type(state)(
-        tactical=state.tactical.detach(),
-        action=state.action.detach(),
-        tick=state.tick.detach(),
+        tactical=torch.where(keep.unsqueeze(1), state.tactical, zeros_tactical),
+        action=torch.where(keep.unsqueeze(1), state.action, zeros_action),
+        tick=torch.where(keep, state.tick, zeros_tick),
     )
 
 
-def _sequence_row_groups(sequence_ids: Sequence[str]) -> tuple[tuple[int, ...], ...]:
-    groups: dict[str, list[int]] = {}
-    order: list[str] = []
-    for index, value in enumerate(sequence_ids):
-        sequence_id = str(value)
-        if not sequence_id:
-            raise ValueError("sequence_id values must be non-empty")
-        if sequence_id not in groups:
-            groups[sequence_id] = []
-            order.append(sequence_id)
-        groups[sequence_id].append(index)
-    return tuple(tuple(groups[sequence_id]) for sequence_id in order)
+def _batch_loss(
+    model: Any,
+    batch: RecurrentMiniBatchV1,
+    torch: Any,
+    F: Any,
+    *,
+    training: bool,
+) -> tuple[Any, dict[str, Any]]:
+    state = model.initial_state(batch.batch_size, device=batch.observations.device)
+    totals = {
+        "movement": torch.zeros((), device=batch.observations.device),
+        "mouse": torch.zeros((), device=batch.observations.device),
+        "buttons": torch.zeros((), device=batch.observations.device),
+        "weapon": torch.zeros((), device=batch.observations.device),
+        "buy": torch.zeros((), device=batch.observations.device),
+    }
+    total = torch.zeros((), device=batch.observations.device)
+    for time_index in range(batch.observations.shape[0]):
+        state = _reset_state(state, batch.hidden_state_mask[time_index], torch)
+        output = model(
+            batch.observations[time_index],
+            state,
+            delta_time_s=batch.duration_s[time_index],
+        )
+        mask = batch.loss_masks[time_index]
+        target = batch.actions[time_index]
+        movement_mask = torch.stack(
+            [((mask & (1 << bit)) != 0).to(torch.float32) for bit in range(3)], dim=1
+        )
+        mouse_mask = torch.stack(
+            [((mask & (1 << bit)) != 0).to(torch.float32) for bit in (3, 4)], dim=1
+        )
+        button_mask = ((mask & (1 << 5)) != 0).to(torch.float32)
+        weapon_mask = ((mask & (1 << 6)) != 0).to(torch.float32)
+        buy_mask = ((mask & (1 << 7)) != 0).to(torch.float32)
+        movement_loss = ((output.movement_mean - target[:, :3]) ** 2 * movement_mask).sum()
+        movement_loss = movement_loss / movement_mask.sum().clamp_min(1.0)
+        mouse_loss = ((output.mouse_loc - target[:, 3:5]) ** 2 * mouse_mask).sum()
+        mouse_loss = mouse_loss / mouse_mask.sum().clamp_min(1.0)
+        button_values = target[:, 5].round().to(torch.int64).unsqueeze(1)
+        button_target = ((button_values >> torch.arange(32, device=target.device)) & 1).to(torch.float32)
+        button_value = F.binary_cross_entropy_with_logits(
+            output.button_logits,
+            button_target,
+            reduction="none",
+        ).mean(dim=1)
+        button_value = (button_value * button_mask).sum() / button_mask.sum().clamp_min(1.0)
+        weapon_target = target[:, 6].round().to(torch.int64).clamp(0, model.weapon_count - 1)
+        weapon_value = F.cross_entropy(output.weapon_logits, weapon_target, reduction="none")
+        weapon_value = (weapon_value * weapon_mask).sum() / weapon_mask.sum().clamp_min(1.0)
+        buy_target = target[:, 7].round().to(torch.int64).clamp(0, model.buy_count - 1)
+        buy_value = F.cross_entropy(output.buy_logits, buy_target, reduction="none")
+        buy_value = (buy_value * buy_mask).sum() / buy_mask.sum().clamp_min(1.0)
+        current = movement_loss + mouse_loss + button_value + weapon_value + buy_value
+        total = total + current
+        totals["movement"] = totals["movement"] + movement_loss
+        totals["mouse"] = totals["mouse"] + mouse_loss
+        totals["buttons"] = totals["buttons"] + button_value
+        totals["weapon"] = totals["weapon"] + weapon_value
+        totals["buy"] = totals["buy"] + buy_value
+        state = output.recurrent_state
+    divisor = max(1, int(batch.observations.shape[0]))
+    return total / divisor, {name: value / divisor for name, value in totals.items()}
 
 
 def train_bc(
@@ -160,137 +205,151 @@ def train_bc(
     dataset_manifest: DatasetManifestV1,
     *,
     output_dir: str | Path | None = None,
+    device: str | None = None,
 ) -> TrainingRunManifestV1:
-    """执行短 BC 训练并保存 checkpoint；训练血缘继承输入数据 purpose。"""
-
     loaded = load_config(config)
     torch, F = _torch_modules()
-    dataset = _load_dataset(dataset_manifest, loaded)
+    purpose = dataset_manifest.effective_purpose()
+    requested_device = str(device or loaded.get("device") or ("cuda" if purpose is DataPurpose.PRODUCTION else "cpu"))
+    resolved_device = resolve_training_device(requested_device)
+    if str(loaded.get("dtype", "float32")) != "float32":
+        raise ValueError("BC training requires float32 tensors")
+    if bool(loaded.get("amp", False)):
+        raise ValueError("BC training requires AMP to be disabled")
     seed = int(loaded.get("seed", 7))
+    sequence_length = int(loaded.get("sequence_length", 128))
+    batch_sequences = int(loaded.get("batch_sequences", loaded.get("batch_size", 32)))
+    if sequence_length <= 0 or batch_sequences <= 0:
+        raise ValueError("sequence_length and batch_sequences must be positive")
+    train_paths = _load_dataset(dataset_manifest, loaded)
+    validation_paths = _validation_paths_for_manifest(dataset_manifest)
+    if validation_paths:
+        _validate_sequence_purpose(validation_paths, purpose)
     torch.manual_seed(seed)
     model = MirageActor(
         weapon_count=int(loaded.get("weapon_count", 16)),
         buy_count=int(loaded.get("buy_action_count", 32)),
+        max_batch_size=batch_sequences,
+    ).to(resolved_device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=float(loaded.get("learning_rate", 1e-3))
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(loaded.get("learning_rate", 1e-3)))
-    max_steps = max(1, int(loaded.get("max_steps", 1)))
-    batch_size = max(1, min(10, int(loaded.get("batch_size", 10))))
-    rows = len(dataset["observation"])
-    observations = dataset["observation"]
-    movement = torch.tensor(
-        list(zip(dataset["forward"], dataset["side"], dataset["up"])), dtype=torch.float32
-    )
-    mouse = torch.tensor(
-        list(zip(dataset["yaw_delta_deg"], dataset["pitch_delta_deg"])), dtype=torch.float32
-    )
-    buttons = _button_targets(dataset["buttons"], torch)
-    weapon_count = int(loaded.get("weapon_count", 16))
-    buy_count = int(loaded.get("buy_action_count", 32))
-    weapons = torch.tensor(dataset["weapon_select"], dtype=torch.long).clamp(0, weapon_count - 1)
-    buys = torch.tensor(dataset["buy_action"], dtype=torch.long).clamp(0, buy_count - 1)
-    loss_masks = torch.tensor(dataset["loss_mask"], dtype=torch.long)
-    sequence_ids = tuple(str(value) for value in dataset["sequence_id"])
-    sequence_groups = _sequence_row_groups(sequence_ids)
-    loss_history: list[float] = []
-    model.train()
-    for step in range(max_steps):
-        optimizer.zero_grad(set_to_none=True)
-        total_loss = torch.zeros((), dtype=torch.float32)
-        sequence_rows = 0
-        for sequence_indices in sequence_groups:
-            recurrent_state = model.initial_state(1)
-            for sequence_position, index in enumerate(sequence_indices, start=1):
-                try:
-                    duration_s = float(dataset["duration_s"][index])
-                except (TypeError, ValueError) as error:
-                    raise ValueError("dataset duration_s values must be numeric") from error
-                if not math.isfinite(duration_s) or duration_s <= 0.0:
-                    duration_s = 1.0 / 128.0
-                duration = torch.tensor(
-                    [duration_s],
-                    dtype=torch.float32,
-                    device=next(model.parameters()).device,
-                )
-                output = model([observations[index]], recurrent_state, delta_time_s=duration)
-                mask = loss_masks[index : index + 1]
-                movement_target = movement[index : index + 1]
-                mouse_target = mouse[index : index + 1]
-                button_target = buttons[index : index + 1]
-                weapon_target = weapons[index : index + 1]
-                buy_target = buys[index : index + 1]
-                move_mask = torch.stack(
-                    [((mask & (1 << bit)) != 0).float() for bit in range(3)], dim=1
-                )
-                mouse_mask = torch.stack(
-                    [((mask & (1 << bit)) != 0).float() for bit in (3, 4)], dim=1
-                )
-                button_mask = ((mask & (1 << 5)) != 0).float()
-                weapon_mask = ((mask & (1 << 6)) != 0).float()
-                buy_mask = ((mask & (1 << 7)) != 0).float()
-                move_loss = _masked_mean((output.movement_mean - movement_target) ** 2, move_mask, torch)
-                mouse_loss = _masked_mean((output.mouse_loc - mouse_target) ** 2, mouse_mask, torch)
-                button_loss = _masked_mean(
-                    F.binary_cross_entropy_with_logits(
-                        output.button_logits,
-                        button_target.to(output.button_logits.device),
-                        reduction="none",
-                    ).mean(dim=1),
-                    button_mask.to(output.button_logits.device),
-                    torch,
-                )
-                weapon_loss = _masked_mean(
-                    F.cross_entropy(
-                        output.weapon_logits,
-                        weapon_target.to(output.weapon_logits.device),
-                        reduction="none",
-                    ),
-                    weapon_mask.to(output.weapon_logits.device),
-                    torch,
-                )
-                buy_loss = _masked_mean(
-                    F.cross_entropy(
-                        output.buy_logits,
-                        buy_target.to(output.buy_logits.device),
-                        reduction="none",
-                    ),
-                    buy_mask.to(output.buy_logits.device),
-                    torch,
-                )
-                total_loss = total_loss + move_loss + mouse_loss + button_loss + weapon_loss + buy_loss
-                sequence_rows += 1
-                recurrent_state = output.recurrent_state
-                if sequence_position % batch_size == 0:
-                    recurrent_state = _detach_recurrent_state(recurrent_state)
-        total_loss = total_loss / max(1, sequence_rows)
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        loss_history.append(float(total_loss.detach().cpu()))
+    epochs = max(1, int(loaded.get("max_steps", loaded.get("max_epochs", 1))))
     if output_dir is None:
         output_dir = loaded.get("output_dir")
     if output_dir is None:
         raise ValueError("output_dir is required either as an argument or in config")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    checkpoint = output_path / "bc-checkpoint.pt"
+    checkpoint_interval = max(1, int(loaded.get("checkpoint_interval_updates", 500)))
+    loaded["device"] = requested_device
+    loaded["sequence_length"] = sequence_length
+    loaded["batch_sequences"] = batch_sequences
+    loss_history: list[float] = []
+    validation_loss_history: list[float] = []
+    head_wise_loss = {name: 0.0 for name in ("movement", "mouse", "buttons", "weapon", "buy")}
+    first_loss = 0.0
+    last_gradient_norm = 0.0
+    parameter_updated = False
+    updates = 0
+    scanner_cursor: dict[str, Any] = {"epoch": 0, "path_index": 0, "sequence_length": sequence_length}
+
+    def _device_report() -> TrainingDeviceReportV1:
+        return TrainingDeviceReportV1(
+            requested=requested_device,
+            device_type=resolved_device.type,
+            device_index=resolved_device.index,
+            device_name=(
+                str(torch.cuda.get_device_name(resolved_device))
+                if resolved_device.type == "cuda"
+                else "CPU"
+            ),
+            torch_version=str(torch.__version__),
+            hip_version=str(getattr(torch.version, "hip", None) or "unavailable"),
+            smoke_loss=first_loss,
+            gradient_norm=last_gradient_norm,
+            parameter_updated=parameter_updated,
+        )
+
+    def _save_checkpoint(epoch_value: int) -> None:
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": loaded,
+                "dataset_manifest": dataset_manifest,
+                "loss_history": loss_history,
+                "validation_loss_history": validation_loss_history,
+                "head_wise_loss": head_wise_loss,
+                "epoch": epoch_value,
+                "scanner_cursor": scanner_cursor,
+                "training_device_report": _device_report(),
+            },
+            checkpoint,
+        )
+
+    model.train()
+    for epoch in range(epochs):
+        for path_index, batch in enumerate(
+            iter_recurrent_minibatches(train_paths, sequence_length, batch_sequences, seed + epoch)
+        ):
+            batch = batch.to(resolved_device)
+            before = tuple(parameter.detach().clone() for parameter in model.parameters())
+            optimizer.zero_grad(set_to_none=True)
+            total_loss, components = _batch_loss(model, batch, torch, F, training=True)
+            if not bool(torch.isfinite(total_loss)):
+                raise RuntimeError("BC training produced a non-finite loss")
+            total_loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float(loaded.get("gradient_clip_norm", 1.0)), error_if_nonfinite=True
+            )
+            optimizer.step()
+            parameter_updated = parameter_updated or any(
+                not torch.equal(old, new.detach())
+                for old, new in zip(before, model.parameters())
+            )
+            updates += 1
+            scanner_cursor = {"epoch": epoch, "path_index": path_index + 1, "sequence_length": sequence_length}
+            first_loss = first_loss or float(total_loss.detach().cpu())
+            last_gradient_norm = float(gradient_norm.detach().cpu())
+            loss_history.append(float(total_loss.detach().cpu()))
+            head_wise_loss = {
+                name: float(value.detach().cpu()) for name, value in components.items()
+            }
+            validation_interval = max(1, int(loaded.get("validation_interval_updates", 250)))
+            if validation_paths and updates % validation_interval == 0:
+                model.eval()
+                values: list[float] = []
+                with torch.no_grad():
+                    for validation_batch in iter_recurrent_minibatches(
+                        validation_paths,
+                        sequence_length,
+                        batch_sequences,
+                        seed + 100000 + updates,
+                    ):
+                        value, _ = _batch_loss(
+                            model,
+                            validation_batch.to(resolved_device),
+                            torch,
+                            F,
+                            training=False,
+                        )
+                        values.append(float(value.detach().cpu()))
+                if values:
+                    validation_loss_history.append(sum(values) / len(values))
+                model.train()
+            if updates > 0 and updates % checkpoint_interval == 0:
+                _save_checkpoint(epoch + 1)
     config_bytes = json.dumps(loaded, sort_keys=True, separators=(",", ":")).encode("utf-8")
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
-    checkpoint = output_path / "bc-checkpoint.pt"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": loaded,
-            "dataset_manifest": dataset_manifest,
-            "loss_history": loss_history,
-        },
-        checkpoint,
-    )
-    purpose = dataset_manifest.effective_purpose()
+    _save_checkpoint(epochs)
+    device_report = _device_report()
     return TrainingRunManifestV1(
         name=output_path.name,
         purpose=purpose,
         dataset_manifest=dataset_manifest,
-        steps=max_steps,
+        steps=updates,
         loss_history=tuple(loss_history),
         checkpoint_path=str(checkpoint),
         config_sha256=config_sha256,
@@ -299,5 +358,14 @@ def train_bc(
             "training_method": "behavior_cloning",
             "optimizer_state": str(checkpoint),
             "source_sha256": dataset_manifest.source_sha256 or "",
+            "device_type": resolved_device.type,
+            "device_index": "" if resolved_device.index is None else str(resolved_device.index),
+            "device_name": device_report.device_name,
+            "torch_version": str(torch.__version__),
+            "hip_version": device_report.hip_version,
+            "sequence_length": str(sequence_length),
+            "batch_sequences": str(batch_sequences),
+            "parameter_updated": str(parameter_updated).lower(),
+            "validation_loss": "" if not validation_loss_history else str(validation_loss_history[-1]),
         },
     )

@@ -8,6 +8,8 @@
 #include <sl_bots_ipc>
 
 native int Get5_GetGameState();
+native void Get5_GetMatchID(char[] matchId, int maxlen);
+native int Get5_GetMapNumber();
 
 #define SLBOTS_SENSE_CAPACITY 64
 #define SLBOTS_MISSING_WINDOW_SIZE 128
@@ -20,6 +22,12 @@ native int Get5_GetGameState();
 #define SLBOTS_PLAYER_PERIPHERAL (1 << 5)
 
 int g_Epoch = 1;
+int g_ControlSequence;
+int g_ControlPolicyGeneration;
+ConVar g_ControlPolicyGenerationCvar;
+int g_RoundNumber;
+bool g_ControlPaused;
+bool g_RulesValid = true;
 int g_ObservationSequence;
 int g_ObservationSnapshotTick[SLBOTS_SENSE_CAPACITY];
 int g_ObservationSnapshotBotCount[SLBOTS_SENSE_CAPACITY];
@@ -33,6 +41,8 @@ int g_BotStateClients[SLBOTS_MAX_BOTS];
 int g_BotStateUserIds[SLBOTS_MAX_BOTS];
 int g_LastPublishedTick = -1;
 int g_LastActionTick = -1;
+int g_LastActionAckTick = -1;
+float g_LastActionPacketReceivedTime;
 int g_LastActionPacket[SLBOTS_ACTION_PACKET_WORDS];
 int g_LastActionClients[SLBOTS_MAX_BOTS];
 int g_LastBuyAction[SLBOTS_MAX_BOTS];
@@ -61,6 +71,8 @@ int g_SmokeExpiryTick[SLBOTS_SENSE_CAPACITY];
 int g_SmokeCount;
 char g_IpcName[128];
 bool g_Get5Available;
+bool g_Get5MatchIdAvailable;
+bool g_Get5MapNumberAvailable;
 bool g_Open;
 
 public Plugin myinfo = {
@@ -72,6 +84,19 @@ public Plugin myinfo = {
 };
 
 public void OnPluginStart() {
+    CreateConVar("sl_bots_instance_id", "", "Dedicated server instance suffix for SL-Bots IPC", FCVAR_PROTECTED);
+    g_ControlPolicyGenerationCvar = CreateConVar(
+        "sl_bots_policy_generation",
+        "0",
+        "Policy generation emitted in SL-Bots telemetry",
+        FCVAR_PROTECTED,
+        true,
+        0.0
+    );
+    HookConVarChange(g_ControlPolicyGenerationCvar, OnPolicyGenerationChanged);
+    RefreshPolicyGeneration();
+    MarkNativeAsOptional("Get5_GetMatchID");
+    MarkNativeAsOptional("Get5_GetMapNumber");
     HookEvent("round_start", Event_RoundStart, EventHookMode_PostNoCopy);
     HookEvent("round_end", Event_RoundEnd, EventHookMode_Post);
     HookEvent("weapon_fire", Event_Observation, EventHookMode_Post);
@@ -87,17 +112,47 @@ public void OnPluginStart() {
     HookEvent("decoy_started", Event_Observation, EventHookMode_Post);
     HookEvent("player_footstep", Event_Observation, EventHookMode_Post);
     HookEvent("player_jump", Event_Observation, EventHookMode_Post);
+    HookEvent("get5_going_live", Event_Get5GoingLive, EventHookMode_PostNoCopy);
+    HookEvent("get5_live", Event_Get5Live, EventHookMode_PostNoCopy);
+    HookEvent("get5_pause", Event_Get5Pause, EventHookMode_PostNoCopy);
+    HookEvent("get5_resume", Event_Get5Resume, EventHookMode_PostNoCopy);
+    HookEvent("get5_backup_restore", Event_Get5BackupRestore, EventHookMode_PostNoCopy);
+    HookEvent("get5_map_end", Event_Get5MapEnd, EventHookMode_PostNoCopy);
+    HookEvent("get5_series_end", Event_Get5SeriesEnd, EventHookMode_PostNoCopy);
     g_Get5Available = GetFeatureStatus(FeatureType_Native, "Get5_GetGameState") == FeatureStatus_Available;
+    g_Get5MatchIdAvailable = GetFeatureStatus(FeatureType_Native, "Get5_GetMatchID") == FeatureStatus_Available;
+    g_Get5MapNumberAvailable = GetFeatureStatus(FeatureType_Native, "Get5_GetMapNumber") == FeatureStatus_Available;
+    g_RulesValid = true;
+    g_ControlPaused = false;
     ResetRuntimeState();
     OpenTransport();
 }
 
 public void OnMapStart() {
     g_Epoch++;
+    g_RoundNumber = 0;
+    g_ControlPaused = false;
+    g_RulesValid = true;
     g_LastPublishedTick = -1;
     g_LastActionTick = -1;
+    RefreshPolicyGeneration();
     ResetRuntimeState();
     OpenTransport();
+}
+
+public void OnPolicyGenerationChanged(ConVar convar, const char[] oldValue, const char[] newValue) {
+    RefreshPolicyGeneration();
+}
+
+void RefreshPolicyGeneration() {
+    if (g_ControlPolicyGenerationCvar == null) {
+        g_ControlPolicyGeneration = 0;
+        return;
+    }
+    g_ControlPolicyGeneration = GetConVarInt(g_ControlPolicyGenerationCvar);
+    if (g_ControlPolicyGeneration < 0) {
+        g_ControlPolicyGeneration = 0;
+    }
 }
 
 public void OnClientPutInServer(int client) {
@@ -110,15 +165,38 @@ public void OnClientDisconnect(int client) {
 
 public void OnPluginEnd() {
     if (g_Open) {
+        PublishControlEvent(SLBOTS_CONTROL_SERIES_END, GetGameTickCount(), g_RoundNumber);
         SLBots_Close();
         g_Open = false;
     }
 }
 
+public void OnMapEnd() {
+    if (g_Open) {
+        PublishControlEvent(SLBOTS_CONTROL_MAP_END, GetGameTickCount(), g_RoundNumber);
+    }
+}
+
 void OpenTransport() {
     char mapName[64];
+    char instanceId[8];
     GetCurrentMap(mapName, sizeof(mapName));
-    FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s", mapName);
+    instanceId[0] = '\0';
+    ConVar instanceCvar = FindConVar("sl_bots_instance_id");
+    if (instanceCvar != null) {
+        GetConVarString(instanceCvar, instanceId, sizeof(instanceId));
+    }
+    if (instanceId[0] != '\0' &&
+        (strcmp(instanceId, "01") != 0 && strcmp(instanceId, "02") != 0 &&
+         strcmp(instanceId, "03") != 0 && strcmp(instanceId, "04") != 0)) {
+        LogError("invalid sl_bots_instance_id: %s", instanceId);
+        instanceId[0] = '\0';
+    }
+    if (instanceId[0] == '\0') {
+        FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s", mapName);
+    } else {
+        FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s_%s", mapName, instanceId);
+    }
     if (g_Open) {
         SLBots_Close();
         g_Open = false;
@@ -131,6 +209,8 @@ void OpenTransport() {
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast) {
     g_Epoch++;
+    g_RoundNumber++;
+    g_ControlPaused = false;
     g_LastPublishedTick = -1;
     g_LastActionTick = -1;
     ResetRuntimeState();
@@ -139,6 +219,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     if (g_Open && SLBots_SwitchEpoch(g_Epoch) < 0) {
         OpenTransport();
     }
+    PublishControlEvent(SLBOTS_CONTROL_ROUND_START, GetGameTickCount(), g_RoundNumber);
 }
 
 public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast) {
@@ -153,10 +234,80 @@ public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast) {
     }
     float position[3] = {0.0, 0.0, 0.0};
     RecordObservationEvent(category, 0, position);
+    PublishControlEvent(SLBOTS_CONTROL_ROUND_END, GetGameTickCount(), g_RoundNumber);
+    int team1Score = GetTeamScore(CS_TEAM_CT);
+    int team2Score = GetTeamScore(CS_TEAM_T);
+    if (g_RoundNumber == 12) {
+        PublishControlEvent(SLBOTS_CONTROL_HALFTIME, GetGameTickCount(), g_RoundNumber);
+    } else if (g_RoundNumber == 24 && team1Score == team2Score) {
+        PublishControlEvent(SLBOTS_CONTROL_OVERTIME_START, GetGameTickCount(), g_RoundNumber);
+    }
+}
+
+public void Event_Get5GoingLive(Event event, const char[] name, bool dontBroadcast) {
+    if (!ValidateMR12Rules()) {
+        g_RulesValid = false;
+        PublishControlEvent(SLBOTS_CONTROL_FALLBACK, GetGameTickCount(), g_RoundNumber);
+        return;
+    }
+    g_RulesValid = true;
+    PublishControlEvent(SLBOTS_CONTROL_RULES_VALIDATED, GetGameTickCount(), g_RoundNumber);
+    PublishControlEvent(SLBOTS_CONTROL_GOING_LIVE, GetGameTickCount(), g_RoundNumber);
+}
+
+public void Event_Get5Live(Event event, const char[] name, bool dontBroadcast) {
+    if (g_RulesValid) {
+        PublishControlEvent(SLBOTS_CONTROL_LIVE, GetGameTickCount(), g_RoundNumber);
+    }
+}
+
+public void Event_Get5Pause(Event event, const char[] name, bool dontBroadcast) {
+    g_ControlPaused = true;
+    PublishControlEvent(SLBOTS_CONTROL_PAUSE, GetGameTickCount(), g_RoundNumber);
+}
+
+public void Event_Get5Resume(Event event, const char[] name, bool dontBroadcast) {
+    g_ControlPaused = false;
+    PublishControlEvent(SLBOTS_CONTROL_RESUME, GetGameTickCount(), g_RoundNumber);
+}
+
+public void Event_Get5BackupRestore(Event event, const char[] name, bool dontBroadcast) {
+    g_Epoch++;
+    ResetRuntimeState();
+    if (g_Open && SLBots_SwitchEpoch(g_Epoch) < 0) {
+        OpenTransport();
+    }
+    PublishControlEvent(SLBOTS_CONTROL_BACKUP_RESTORE, GetGameTickCount(), g_RoundNumber);
+}
+
+public void Event_Get5MapEnd(Event event, const char[] name, bool dontBroadcast) {
+    g_RulesValid = false;
+    PublishControlEvent(SLBOTS_CONTROL_MAP_END, GetGameTickCount(), g_RoundNumber);
+}
+
+public void Event_Get5SeriesEnd(Event event, const char[] name, bool dontBroadcast) {
+    g_RulesValid = false;
+    PublishControlEvent(SLBOTS_CONTROL_SERIES_END, GetGameTickCount(), g_RoundNumber);
+}
+
+bool ValidateMR12Rules() {
+    return ValidateCvar("mp_maxrounds", 24) &&
+        ValidateCvar("mp_halftime", 1) &&
+        ValidateCvar("mp_match_can_clinch", 1) &&
+        ValidateCvar("mp_overtime_enable", 1) &&
+        ValidateCvar("mp_overtime_maxrounds", 6) &&
+        ValidateCvar("mp_overtime_startmoney", 10000);
+}
+
+bool ValidateCvar(const char[] name, int expected) {
+    ConVar cvar = FindConVar(name);
+    return cvar != null && GetConVarInt(cvar) == expected;
 }
 
 void ResetRuntimeState() {
     g_BotCount = 0;
+    g_LastActionAckTick = -1;
+    g_LastActionPacketReceivedTime = 0.0;
     g_ObservationSnapshotHead = 0;
     g_ObservationSnapshotCount = 0;
     g_SoundHead = 0;
@@ -344,11 +495,12 @@ public Action OnPlayerRunCmd(
     if (validMask & SLBOTS_ACTION_MASK_BUY) {
         ExecuteBuyAction(client, slot, Signed16(g_LastActionPacket[actionOffset + 7] >> 16));
     }
+    RecordActionApplied(tickcount);
     return Plugin_Changed;
 }
 
 int GetActivePhase() {
-    if (!g_Get5Available) {
+    if (!g_Get5Available || !g_RulesValid || g_ControlPaused) {
         return -1;
     }
     int state = Get5_GetGameState();
@@ -1220,6 +1372,20 @@ void PollActionPacket() {
         g_LastActionClients[index] = index < packetBotCount ? g_ObservationSnapshotClients[snapshot][index] : 0;
     }
     g_LastActionTick = packetTick + 1;
+    g_LastActionAckTick = -1;
+    g_LastActionPacketReceivedTime = GetEngineTime();
+}
+
+void RecordActionApplied(int serverTick) {
+    if (g_LastActionAckTick == serverTick || g_LastActionPacketReceivedTime <= 0.0) {
+        return;
+    }
+    int latencyUs = RoundToNearest((GetEngineTime() - g_LastActionPacketReceivedTime) * 1000000.0);
+    if (latencyUs < 0) {
+        latencyUs = 0;
+    }
+    g_LastActionAckTick = serverTick;
+    PublishControlEvent(SLBOTS_CONTROL_LATENCY_SAMPLE, serverTick, g_RoundNumber, latencyUs);
 }
 
 void ApplyNeutralAction(
@@ -1315,6 +1481,63 @@ float ClampFloat(float value, float minimum, float maximum) {
     return value;
 }
 
+void PublishControlEvent(int eventType, int serverTick, int roundNumber, int valueUs = 0) {
+    if (!g_Open) {
+        return;
+    }
+    int packet[SLBOTS_CONTROL_EVENT_WORDS];
+    for (int index = 0; index < SLBOTS_CONTROL_EVENT_WORDS; index++) {
+        packet[index] = 0;
+    }
+    SetPacketByte(packet, 0, 'S');
+    SetPacketByte(packet, 1, 'L');
+    SetPacketByte(packet, 2, 'B');
+    SetPacketByte(packet, 3, 'C');
+    SetPacketByte(packet, 4, 'T');
+    SetPacketByte(packet, 5, 'L');
+    SetPacketByte(packet, 6, '1');
+    SetPacketInt16(packet, 8, SLBOTS_CONTROL_SCHEMA_VERSION);
+    SetPacketInt16(packet, 10, eventType);
+    g_ControlSequence++;
+    SetPacketInt64(packet, 12, g_ControlSequence, 0);
+    SetPacketInt32(packet, 20, g_Epoch);
+    SetPacketInt32(packet, 24, serverTick);
+    SetPacketInt16(packet, 28, g_Get5Available ? Get5_GetGameState() : -1);
+    SetPacketInt16(packet, 30, g_Get5MapNumberAvailable ? Get5_GetMapNumber() : SLBOTS_MAP_ID_MIRAGE);
+    SetPacketInt16(packet, 32, roundNumber);
+    SetPacketInt16(packet, 34, GetTeamScore(CS_TEAM_CT));
+    SetPacketInt16(packet, 36, GetTeamScore(CS_TEAM_T));
+    SetPacketInt32(packet, 38, g_ControlPolicyGeneration);
+    SetPacketInt64(packet, 42, valueUs, 0);
+    int matchHashLow = 0;
+    int matchHashHigh = 0;
+    if (g_Get5MatchIdAvailable) {
+        char matchId[128];
+        Get5_GetMatchID(matchId, sizeof(matchId));
+        matchHashLow = HashText32(matchId, 0x811C9DC5);
+        matchHashHigh = HashText32(matchId, 0x01000193);
+    }
+    SetPacketInt64(packet, 50, matchHashLow, matchHashHigh);
+    SetPacketInt32(packet, 58, ControlCrc32(packet, SLBOTS_CONTROL_EVENT_BYTES));
+    if (SLBots_PublishControl(packet) <= 0) {
+        LogError("SL-Bots control event publish failed: type=%d sequence=%d", eventType, g_ControlSequence);
+    }
+}
+
+int HashText32(const char[] value, int seed) {
+    int hash = seed;
+    for (int index = 0; value[index] != '\0'; index++) {
+        hash ^= value[index];
+        hash *= 0x01000193;
+    }
+    return hash;
+}
+
+void SetPacketInt64(int[] packet, int byteOffset, int low, int high) {
+    SetPacketInt32(packet, byteOffset, low);
+    SetPacketInt32(packet, byteOffset + 4, high);
+}
+
 int GetPacketByte(const int[] packet, int byteOffset) {
     return (packet[byteOffset / 4] >> ((byteOffset % 4) * 8)) & 0xFF;
 }
@@ -1353,6 +1576,22 @@ int Crc32(const int[] packet, int byteLength) {
     for (int index = 0; index < byteLength; index++) {
         int value = GetPacketByte(packet, index);
         if (index >= 32 && index < 36) {
+            value = 0;
+        }
+        crc ^= value;
+        for (int bit = 0; bit < 8; bit++) {
+            int mask = -(crc & 1);
+            crc = (crc >>> 1) ^ (0xEDB88320 & mask);
+        }
+    }
+    return crc ^ -1;
+}
+
+int ControlCrc32(const int[] packet, int byteLength) {
+    int crc = -1;
+    for (int index = 0; index < byteLength; index++) {
+        int value = GetPacketByte(packet, index);
+        if (index >= 58 && index < 62) {
             value = 0;
         }
         crc ^= value;

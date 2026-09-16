@@ -36,10 +36,10 @@ type rawFrame struct {
 }
 
 type arrowSink struct {
-	file   *os.File
-	writer *ipc.FileWriter
+	file    *os.File
+	writer  *ipc.FileWriter
 	builder *array.RecordBuilder
-	rows   int
+	rows    int
 }
 
 func rawSchemaV1(purpose, mapName string) *arrow.Schema {
@@ -157,7 +157,7 @@ func vectorValues(x, y, z float64) []float64 {
 	return []float64{x, y, z}
 }
 
-func playerSnapshot(player *common.Player) map[string]any {
+func playerSnapshot(player *common.Player, roundNumber int) map[string]any {
 	position := player.Position()
 	eyePosition := player.PositionEyes()
 	velocity := player.Velocity()
@@ -168,11 +168,11 @@ func playerSnapshot(player *common.Player) map[string]any {
 			continue
 		}
 		weapons = append(weapons, map[string]any{
-			"name":           weapon.String(),
-			"unique_id":      weapon.UniqueID(),
-			"ammo_in_mag":    weapon.AmmoInMagazine(),
-			"ammo_reserve":   weapon.AmmoReserve(),
-			"ammo_type":      weapon.AmmoType(),
+			"name":            weapon.String(),
+			"unique_id":       weapon.UniqueID(),
+			"ammo_in_mag":     weapon.AmmoInMagazine(),
+			"ammo_reserve":    weapon.AmmoReserve(),
+			"ammo_type":       weapon.AmmoType(),
 			"equipment_class": fmt.Sprint(weapon.Class()),
 		})
 	}
@@ -181,6 +181,7 @@ func playerSnapshot(player *common.Player) map[string]any {
 	})
 	return map[string]any{
 		"entity_id":          player.EntityID,
+		"round_number":       roundNumber,
 		"steam_id32":         player.SteamID32(),
 		"name":               player.Name,
 		"team":               int(player.Team),
@@ -232,13 +233,13 @@ func projectileSnapshot(projectile *common.GrenadeProjectile) map[string]any {
 	position := projectile.Position()
 	velocity := projectile.Velocity()
 	return map[string]any{
-		"unique_id":       projectile.UniqueID(),
-		"weapon":          equipmentName(projectile.WeaponInstance),
-		"thrower":         playerRef(projectile.Thrower),
-		"owner":           playerRef(projectile.Owner),
-		"position":        vectorValues(position.X, position.Y, position.Z),
-		"velocity":        vectorValues(velocity.X, velocity.Y, velocity.Z),
-		"trajectory_len":  len(projectile.Trajectory),
+		"unique_id":      projectile.UniqueID(),
+		"weapon":         equipmentName(projectile.WeaponInstance),
+		"thrower":        playerRef(projectile.Thrower),
+		"owner":          playerRef(projectile.Owner),
+		"position":       vectorValues(position.X, position.Y, position.Z),
+		"velocity":       vectorValues(velocity.X, velocity.Y, velocity.Z),
+		"trajectory_len": len(projectile.Trajectory),
 	}
 }
 
@@ -257,7 +258,7 @@ func recordGrenadeEvent(pending *[]map[string]any, name string, event events.Gre
 	})
 }
 
-func registerEventHandlers(parser demoinfocs.Parser, pending *[]map[string]any) {
+func registerEventHandlers(parser demoinfocs.Parser, pending *[]map[string]any, roundNumber *int) {
 	parser.RegisterEventHandler(func(event events.WeaponFire) {
 		appendEvent(pending, map[string]any{
 			"type":    "weapon_fire",
@@ -273,41 +274,41 @@ func registerEventHandlers(parser demoinfocs.Parser, pending *[]map[string]any) 
 	})
 	parser.RegisterEventHandler(func(event events.PlayerHurt) {
 		appendEvent(pending, map[string]any{
-			"type":               "player_hurt",
-			"player":             playerRef(event.Player),
-			"attacker":           playerRef(event.Attacker),
-			"weapon":             equipmentName(event.Weapon),
-			"health":             event.Health,
-			"armor":              event.Armor,
-			"health_damage":      event.HealthDamage,
-			"armor_damage":       event.ArmorDamage,
+			"type":                "player_hurt",
+			"player":              playerRef(event.Player),
+			"attacker":            playerRef(event.Attacker),
+			"weapon":              equipmentName(event.Weapon),
+			"health":              event.Health,
+			"armor":               event.Armor,
+			"health_damage":       event.HealthDamage,
+			"armor_damage":        event.ArmorDamage,
 			"health_damage_taken": event.HealthDamageTaken,
 			"armor_damage_taken":  event.ArmorDamageTaken,
-			"hit_group":          int(event.HitGroup),
+			"hit_group":           int(event.HitGroup),
 		})
 	})
 	parser.RegisterEventHandler(func(event events.PlayerFlashed) {
 		appendEvent(pending, map[string]any{
-			"type":          "player_flashed",
-			"player":        playerRef(event.Player),
-			"attacker":      playerRef(event.Attacker),
+			"type":           "player_flashed",
+			"player":         playerRef(event.Player),
+			"attacker":       playerRef(event.Attacker),
 			"flash_duration": event.FlashDuration().Seconds(),
 		})
 	})
 	parser.RegisterEventHandler(func(event events.Kill) {
 		appendEvent(pending, map[string]any{
-			"type":              "kill",
-			"killer":            playerRef(event.Killer),
-			"victim":            playerRef(event.Victim),
-			"assister":          playerRef(event.Assister),
-			"weapon":            equipmentName(event.Weapon),
+			"type":               "kill",
+			"killer":             playerRef(event.Killer),
+			"victim":             playerRef(event.Victim),
+			"assister":           playerRef(event.Assister),
+			"weapon":             equipmentName(event.Weapon),
 			"penetrated_objects": event.PenetratedObjects,
-			"is_headshot":       event.IsHeadshot,
-			"assisted_flash":    event.AssistedFlash,
-			"attacker_blind":    event.AttackerBlind,
-			"no_scope":          event.NoScope,
-			"through_smoke":     event.ThroughSmoke,
-			"distance":          event.Distance,
+			"is_headshot":        event.IsHeadshot,
+			"assisted_flash":     event.AssistedFlash,
+			"attacker_blind":     event.AttackerBlind,
+			"no_scope":           event.NoScope,
+			"through_smoke":      event.ThroughSmoke,
+			"distance":           event.Distance,
 		})
 	})
 	parser.RegisterEventHandler(func(event events.GrenadeProjectileThrow) {
@@ -342,14 +343,19 @@ func registerEventHandlers(parser demoinfocs.Parser, pending *[]map[string]any) 
 		})
 	})
 	parser.RegisterEventHandler(func(event events.RoundStart) {
-		appendEvent(pending, map[string]any{"type": "round_start"})
+		*roundNumber = *roundNumber + 1
+		appendEvent(pending, map[string]any{
+			"type":         "round_start",
+			"round_number": *roundNumber,
+		})
 	})
 	parser.RegisterEventHandler(func(event events.RoundEnd) {
 		appendEvent(pending, map[string]any{
-			"type":    "round_end",
-			"message": event.Message,
-			"reason":  int(event.Reason),
-			"winner":  int(event.Winner),
+			"type":         "round_end",
+			"round_number": *roundNumber,
+			"message":      event.Message,
+			"reason":       int(event.Reason),
+			"winner":       int(event.Winner),
 		})
 	})
 	parser.RegisterEventHandler(func(event events.RoundFreezetimeEnd) {
@@ -384,14 +390,14 @@ func registerEventHandlers(parser demoinfocs.Parser, pending *[]map[string]any) 
 	})
 }
 
-func capturePlayers(parser demoinfocs.Parser) []map[string]any {
+func capturePlayers(parser demoinfocs.Parser, roundNumber int) []map[string]any {
 	players := parser.GameState().Participants().Playing()
 	snapshots := make([]map[string]any, 0, len(players))
 	for _, player := range players {
 		if player == nil {
 			continue
 		}
-		snapshots = append(snapshots, playerSnapshot(player))
+		snapshots = append(snapshots, playerSnapshot(player, roundNumber))
 	}
 	sort.Slice(snapshots, func(i, j int) bool {
 		return snapshots[i]["entity_id"].(int) < snapshots[j]["entity_id"].(int)
@@ -437,10 +443,11 @@ func parseDemo(input, output, purpose string) (common.DemoHeader, error) {
 	}
 	defer func() { _ = closeSink() }()
 	var pending []map[string]any
+	roundNumber := 0
 	var sinkErr error
 	lastTick := -1
 	lastTime := -1.0
-	registerEventHandlers(parser, &pending)
+	registerEventHandlers(parser, &pending, &roundNumber)
 	parser.RegisterEventHandler(func(event events.FrameDone) {
 		if sinkErr != nil {
 			return
@@ -464,7 +471,7 @@ func parseDemo(input, output, purpose string) (common.DemoHeader, error) {
 			serverTick: int32(tick),
 			demoTime:   now,
 			deltaTime:  float32(delta),
-			players:    capturePlayers(parser),
+			players:    capturePlayers(parser, roundNumber),
 			events:     pending,
 		}); err != nil {
 			sinkErr = err

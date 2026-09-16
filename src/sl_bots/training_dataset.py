@@ -1,0 +1,503 @@
+"""有界 Demo 序列索引和循环 TBPTT minibatch。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from dataclasses import replace
+from hashlib import sha256
+import json
+import random
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+from .action_reconstruction import ActionLabelV1, reconstruct_action, write_sequence_shard
+from .contracts import DataPurpose, Phase, ensure_purpose
+from .demo_pipeline import (
+    DemoCorpusEntryV1,
+    RawTickV1,
+    discover_demo_headers,
+    ingest_demo,
+    read_raw_ticks,
+)
+from .lineage import DatasetManifestV1, ProductionLineageError
+from .observation_projection import ObservationMemory, project_observation
+
+
+_ACTION_WIDTH = 8
+_REQUIRED_COLUMNS = (
+    "observation",
+    "sequence_id",
+    "target_tick",
+    "forward",
+    "side",
+    "up",
+    "yaw_delta_deg",
+    "pitch_delta_deg",
+    "buttons",
+    "weapon_select",
+    "buy_action",
+    "loss_mask",
+    "duration_s",
+)
+
+
+@dataclass(frozen=True)
+class RecurrentMiniBatchV1:
+    observations: Any
+    actions: Any
+    loss_masks: Any
+    duration_s: Any
+    hidden_state_mask: Any
+    sequence_ids: tuple[tuple[str, ...], ...]
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.observations.shape[1])
+
+    def to(self, device: Any) -> "RecurrentMiniBatchV1":
+        return replace(
+            self,
+            observations=self.observations.to(device),
+            actions=self.actions.to(device),
+            loss_masks=self.loss_masks.to(device),
+            duration_s=self.duration_s.to(device),
+            hidden_state_mask=self.hidden_state_mask.to(device),
+        )
+
+
+def _torch() -> Any:
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("PyTorch 2.9 is required for recurrent dataset batches") from error
+    return torch
+
+
+def _arrow_parquet() -> Any:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError("pyarrow is required for recurrent dataset batches") from error
+    return pq
+
+
+def _row_value(batch: Any, name: str, index: int, default: Any = None) -> Any:
+    if name not in batch.schema.names:
+        return default
+    return batch.column(batch.schema.get_field_index(name))[index].as_py()
+
+
+def _iter_rows(path: Path, batch_size: int) -> Iterator[dict[str, Any]]:
+    pq = _arrow_parquet()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    parquet_file = pq.ParquetFile(str(path))
+    missing = [name for name in _REQUIRED_COLUMNS if name not in parquet_file.schema.names]
+    if missing:
+        raise ValueError(f"sequence shard is missing columns: {', '.join(missing)}")
+    for batch in parquet_file.iter_batches(batch_size=max(1, batch_size), columns=list(_REQUIRED_COLUMNS)):
+        for index in range(batch.num_rows):
+            yield {
+                name: _row_value(batch, name, index)
+                for name in _REQUIRED_COLUMNS
+            }
+
+
+def _normalize_observation(value: Any) -> bytes:
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    value = bytes(value)
+    if len(value) != 256:
+        raise ValueError("sequence observations must contain 256-byte payloads")
+    return value
+
+
+def _normalize_window(rows: Sequence[Mapping[str, Any]], sequence_length: int) -> RecurrentMiniBatchV1:
+    torch = _torch()
+    if not rows:
+        raise ValueError("recurrent windows cannot be empty")
+    batch_size = len(rows)
+    observations = torch.zeros((sequence_length, batch_size, 256), dtype=torch.float32)
+    actions = torch.zeros((sequence_length, batch_size, _ACTION_WIDTH), dtype=torch.float32)
+    loss_masks = torch.zeros((sequence_length, batch_size), dtype=torch.int64)
+    duration_s = torch.full((sequence_length, batch_size), 1.0 / 128.0, dtype=torch.float32)
+    hidden_state_mask = torch.zeros((sequence_length, batch_size), dtype=torch.bool)
+    sequence_ids: list[str] = []
+    for batch_index, row_group in enumerate(rows):
+        sequence_id = str(row_group[0]["sequence_id"])
+        if not sequence_id:
+            raise ValueError("sequence_id values must be non-empty")
+        sequence_ids.append(sequence_id)
+        if any(str(row["sequence_id"]) != sequence_id for row in row_group):
+            raise ValueError("a recurrent window cannot cross sequence IDs")
+        for time_index, row in enumerate(row_group[:sequence_length]):
+            observations[time_index, batch_index] = torch.tensor(
+                list(_normalize_observation(row["observation"])), dtype=torch.float32
+            ) / 255.0
+            actions[time_index, batch_index] = torch.tensor(
+                [
+                    float(row["forward"]),
+                    float(row["side"]),
+                    float(row["up"]),
+                    float(row["yaw_delta_deg"]),
+                    float(row["pitch_delta_deg"]),
+                    float(row["buttons"]),
+                    float(row["weapon_select"]),
+                    float(row["buy_action"]),
+                ],
+                dtype=torch.float32,
+            )
+            loss_masks[time_index, batch_index] = int(row["loss_mask"])
+            duration_s[time_index, batch_index] = max(float(row["duration_s"]), 1.0 / 128.0)
+            hidden_state_mask[time_index, batch_index] = time_index > 0
+    time_major_ids = tuple(tuple(sequence_ids[index] for index in range(batch_size)) for _ in range(sequence_length))
+    return RecurrentMiniBatchV1(
+        observations=observations,
+        actions=actions,
+        loss_masks=loss_masks,
+        duration_s=duration_s,
+        hidden_state_mask=hidden_state_mask,
+        sequence_ids=time_major_ids,
+    )
+
+
+def _path_windows(path: Path, sequence_length: int) -> Iterator[list[dict[str, Any]]]:
+    current: list[dict[str, Any]] = []
+    current_sequence: str | None = None
+    for row in _iter_rows(path, sequence_length):
+        sequence_id = str(row["sequence_id"])
+        if current_sequence is None:
+            current_sequence = sequence_id
+        if sequence_id != current_sequence:
+            if current:
+                yield current
+            current = []
+            current_sequence = sequence_id
+        current.append(row)
+        if len(current) == sequence_length:
+            yield current
+            current = []
+    if current:
+        yield current
+
+
+def iter_recurrent_minibatches(
+    paths: Sequence[Path],
+    sequence_length: int,
+    batch_sequences: int,
+    seed: int,
+) -> Iterator[RecurrentMiniBatchV1]:
+    if sequence_length <= 0 or batch_sequences <= 0:
+        raise ValueError("sequence_length and batch_sequences must be positive")
+    ordered_paths = [Path(path).resolve() for path in paths]
+    random.Random(seed).shuffle(ordered_paths)
+    pending: list[list[dict[str, Any]]] = []
+    for path in ordered_paths:
+        for window in _path_windows(path, sequence_length):
+            pending.append(window)
+            if len(pending) == batch_sequences:
+                yield _normalize_window(pending, sequence_length)
+                pending = []
+    if pending:
+        yield _normalize_window(pending, sequence_length)
+
+
+def sequence_paths(manifest: DatasetManifestV1, split: str) -> tuple[Path, ...]:
+    if not isinstance(manifest, DatasetManifestV1):
+        raise TypeError("manifest must be DatasetManifestV1")
+    split = str(split)
+    if split not in {"train", "validation", "test"}:
+        raise ValueError("split must be train, validation or test")
+    encoded = manifest.metadata.get(f"{split}_paths_json", "[]")
+    try:
+        values = json.loads(encoded)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"manifest {split} paths are not valid JSON") from error
+    if not isinstance(values, list):
+        raise ValueError(f"manifest {split} paths must be a JSON list")
+    return tuple(Path(str(value)).resolve() for value in values)
+
+
+def _player_id(player: Mapping[str, Any]) -> str | None:
+    for name in ("entity_id", "steam_id32", "id"):
+        value = player.get(name)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def _sequence_groups(ticks: Sequence[RawTickV1]) -> dict[tuple[str, str], list[RawTickV1]]:
+    groups: dict[tuple[str, str], list[RawTickV1]] = {}
+    current_round: str | None = None
+    for tick in ticks:
+        event_round: str | None = None
+        round_start_without_number = False
+        for event in tick.events:
+            for name in ("round_number", "round", "round_id"):
+                if name in event:
+                    event_round = str(event[name])
+                    break
+            if event_round is None and str(event.get("type", "")) == "round_start":
+                round_start_without_number = True
+        if event_round is not None:
+            current_round = event_round
+        elif round_start_without_number:
+            try:
+                current_round = str(int(current_round or "0") + 1)
+            except ValueError:
+                current_round = "1"
+        for player in tick.players:
+            player_id = _player_id(player)
+            if player_id is None:
+                continue
+            round_number = None
+            for name in ("round_number", "round", "round_id"):
+                if name in player:
+                    round_number = str(player[name])
+                    current_round = round_number
+                    break
+            key = (round_number or event_round or current_round or "0", player_id)
+            groups.setdefault(key, []).append(tick)
+    return groups
+
+
+def _event_belongs_to(event: Mapping[str, Any], player_id: str) -> bool:
+    for name in ("source_id", "player_id", "shooter_id", "attacker_id", "thrower_id"):
+        if name in event and str(event[name]) == player_id:
+            return True
+    for name in ("source", "player", "shooter", "attacker", "thrower"):
+        value = event.get(name)
+        if isinstance(value, Mapping) and _player_id(value) == player_id:
+            return True
+    return False
+
+
+def _human_record(tick: RawTickV1, next_tick: RawTickV1, player_id: str, duration_s: float) -> dict[str, Any]:
+    player = next(
+        (value for value in tick.players if _player_id(value) == player_id),
+        {},
+    )
+    position = player.get("position")
+    if isinstance(position, Mapping):
+        position = (position.get("x"), position.get("y"), position.get("z"))
+    if not isinstance(position, Sequence) or isinstance(position, (str, bytes, bytearray)) or len(position) < 2:
+        position = None
+    else:
+        try:
+            position = tuple(float(value) for value in position[:3])
+        except (TypeError, ValueError):
+            position = None
+    utility_types = {
+        "grenade_projectile_throw",
+        "smoke_start",
+        "flash_explode",
+        "fire_grenade_start",
+        "he_explode",
+        "decoy_start",
+    }
+    utility = 0
+    engagement_distance: float | None = None
+    for event in (*tick.events, *next_tick.events):
+        event_type = str(event.get("type", "")).lower()
+        if _event_belongs_to(event, player_id) and (
+            event_type in utility_types or "grenade" in event_type or event.get("utility")
+        ):
+            utility += 1
+        if _event_belongs_to(event, player_id) and event_type == "kill":
+            try:
+                engagement_distance = float(event["distance"])
+            except (KeyError, TypeError, ValueError):
+                pass
+    alive = player.get("is_alive", player.get("alive"))
+    if alive is None and player.get("health") is not None:
+        alive = float(player["health"]) > 0.0
+    try:
+        yaw_deg = float(player.get("view_yaw_deg", 0.0))
+    except (TypeError, ValueError):
+        yaw_deg = 0.0
+    return {
+        "yaw_deg": yaw_deg,
+        "duration_s": duration_s,
+        "utility": utility,
+        "position": position,
+        "position_valid": position is not None,
+        "engagement_distance": engagement_distance,
+        "alive": None if alive is None else bool(alive),
+    }
+
+
+def _sequence_manifest(
+    raw_manifest: DatasetManifestV1,
+    entry: DemoCorpusEntryV1,
+) -> DatasetManifestV1:
+    return DatasetManifestV1(
+        name=f"{entry.sha256}-mr15",
+        purpose=raw_manifest.effective_purpose(),
+        parents=(raw_manifest,),
+        artifact_type="mr15_demo_sequence_source",
+        source_sha256=entry.sha256,
+        parser_version=raw_manifest.parser_version,
+        projection_version=raw_manifest.projection_version,
+        metadata={
+            "map_name": "de_mirage",
+            "ruleset": "mr15",
+            "regulation_max_rounds": "30",
+            "demo_sha256": entry.sha256,
+        },
+    )
+
+
+def _convert_demo(
+    entry: DemoCorpusEntryV1,
+    raw_manifest: DatasetManifestV1,
+    sequence_root: Path,
+    split: str,
+) -> tuple[Path, ...]:
+    raw_path = raw_manifest.metadata.get("raw_arrow_path") or raw_manifest.metadata.get("path")
+    if not raw_path:
+        raise ValueError(f"raw manifest {raw_manifest.name} does not declare an Arrow path")
+    ticks = read_raw_ticks(raw_path)
+    source_manifest = _sequence_manifest(raw_manifest, entry)
+    paths: list[Path] = []
+    for (round_number, player_id), group in sorted(_sequence_groups(ticks).items()):
+        if len(group) < 2:
+            continue
+        group = sorted(group, key=lambda tick: tick.server_tick)
+        memory = ObservationMemory(phase=Phase.LIVE)
+        observations = []
+        actions: list[ActionLabelV1] = []
+        human_records: list[Mapping[str, Any]] = []
+        sequence_id = f"{entry.sha256}/de_mirage/{round_number}/{player_id}"
+        for index in range(len(group) - 1):
+            current = group[index]
+            following = group[index + 1]
+            observations.append(project_observation(current, player_id, memory).to_bytes())
+            action = reconstruct_action(
+                group[index - 1] if index else current,
+                current,
+                following,
+                observer_id=player_id,
+            )
+            actions.append(
+                ActionLabelV1(
+                    target_tick=action.target_tick,
+                    forward=action.forward,
+                    side=action.side,
+                    up=action.up,
+                    yaw_delta_deg=action.yaw_delta_deg,
+                    pitch_delta_deg=action.pitch_delta_deg,
+                    buttons=action.buttons,
+                    weapon_select=action.weapon_select,
+                    buy_action=action.buy_action,
+                    loss_mask=action.loss_mask,
+                    duration_s=action.duration_s,
+                    yaw_rate_deg_s=action.yaw_rate_deg_s,
+                    pitch_rate_deg_s=action.pitch_rate_deg_s,
+                    frame_delta_ticks=action.frame_delta_ticks,
+                    sequence_id=sequence_id,
+                )
+            )
+            human_records.append(
+                _human_record(current, following, player_id, action.duration_s)
+            )
+        output = sequence_root / split / (
+            f"{_safe_filename(entry.sha256[:16])}-r{_safe_filename(round_number)}-p{_safe_filename(player_id)}.parquet"
+        )
+        overtime = any(
+            bool(player.get("overtime", False))
+            for tick in group
+            for player in tick.players
+            if _player_id(player) == player_id
+        ) or round_number.isdigit() and int(round_number) > 30
+        write_sequence_shard(
+            output,
+            observations,
+            actions,
+            source_manifest=source_manifest,
+            phase="live",
+            human_records=human_records,
+            metadata={
+                "ruleset": "mr15",
+                "regulation_max_rounds": "30",
+                "demo_sha256": entry.sha256,
+                "overtime": str(overtime).lower(),
+            },
+        )
+        paths.append(output.resolve())
+    return tuple(paths)
+
+
+def ingest_demo_corpus(
+    input_root: Path,
+    data_root: Path,
+    extractor_path: Path,
+    purpose: DataPurpose,
+    expected_count: int = 10,
+    *,
+    allow_header_only: bool = False,
+) -> DatasetManifestV1:
+    requested_purpose = ensure_purpose(purpose)
+    entries = tuple(sorted(discover_demo_headers(input_root), key=lambda item: item.sha256))
+    mirage = tuple(entry for entry in entries if entry.header.map_name == "de_mirage")
+    if len(mirage) != expected_count:
+        raise ValueError(f"expected {expected_count} Mirage demos, found {len(mirage)}")
+    hashes = [entry.sha256 for entry in mirage]
+    if len(set(hashes)) != len(hashes):
+        raise ValueError("Mirage Demo SHA-256 values must be unique")
+    root = Path(data_root).resolve()
+    sequence_root = root / "sequences"
+    split_entries = {
+        "train": mirage[:8],
+        "validation": mirage[8:9],
+        "test": mirage[9:],
+    }
+    parents: list[DatasetManifestV1] = []
+    split_paths: dict[str, tuple[Path, ...]] = {}
+    seen_parent_names: set[str] = set()
+    for split, split_values in split_entries.items():
+        paths: list[Path] = []
+        for entry in split_values:
+            raw_manifest = ingest_demo(
+                entry.path,
+                root,
+                requested_purpose,
+                extractor_path=extractor_path,
+                allow_header_only=allow_header_only,
+            )
+            if raw_manifest.effective_purpose() is not requested_purpose:
+                raise ProductionLineageError(
+                    f"Demo {entry.path} purpose does not match corpus purpose"
+                )
+            parent = _sequence_manifest(raw_manifest, entry)
+            if parent.name not in seen_parent_names:
+                parents.append(parent)
+                seen_parent_names.add(parent.name)
+            paths.extend(_convert_demo(entry, raw_manifest, sequence_root, split))
+        split_paths[split] = tuple(paths)
+    metadata: dict[str, str] = {
+        "map_name": "de_mirage",
+        "ruleset": "mr15",
+        "regulation_max_rounds": "30",
+        "expected_demo_count": str(expected_count),
+        "splits_json": json.dumps(list(split_entries), separators=(",", ":")),
+        "input_root": str(Path(input_root).resolve()),
+        "corpus_sha256": sha256("".join(hashes).encode("ascii")).hexdigest(),
+    }
+    for split, paths in split_paths.items():
+        metadata[f"{split}_paths_json"] = json.dumps([str(path) for path in paths], separators=(",", ":"))
+    return DatasetManifestV1(
+        name="prodemo-mr15-corpus",
+        purpose=requested_purpose,
+        parents=tuple(parents),
+        artifact_type="mr15_sequence_corpus",
+        source_sha256=metadata["corpus_sha256"],
+        parser_version="demoinfocs-golang/v3.3.0",
+        projection_version="ObservationProjectionV1",
+        metadata=metadata,
+    )

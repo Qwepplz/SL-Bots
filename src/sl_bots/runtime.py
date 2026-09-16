@@ -173,6 +173,7 @@ class SharedMemoryRingV1:
         self._read_sequence = 0
         self._aborted = False
         self._lock = threading.Lock()
+        self._data_event = threading.Event()
 
     @property
     def size(self) -> int:
@@ -193,6 +194,7 @@ class SharedMemoryRingV1:
             sequence = self._write_sequence
             self._slots[sequence % self.capacity] = packet
             self._write_sequence += 1
+            self._data_event.set()
             return sequence
 
     def try_read(self) -> bytes | None:
@@ -205,6 +207,8 @@ class SharedMemoryRingV1:
             packet = self._slots[sequence % self.capacity]
             self._slots[sequence % self.capacity] = None
             self._read_sequence += 1
+            if self._read_sequence >= self._write_sequence:
+                self._data_event.clear()
             if packet is None:
                 raise RuntimeError("SPSC queue slot was published without a packet")
             return packet
@@ -219,6 +223,7 @@ class SharedMemoryRingV1:
         with self._lock:
             self._aborted = True
             self._slots = [None] * self.capacity
+            self._data_event.set()
 
     def reset(self) -> None:
         with self._lock:
@@ -226,6 +231,17 @@ class SharedMemoryRingV1:
             self._write_sequence = 0
             self._read_sequence = 0
             self._aborted = False
+            self._data_event.clear()
+
+    def wait_for_data(self, timeout_ms: int) -> bool:
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 0:
+            raise ValueError("timeout_ms must be a non-negative integer")
+        if self.aborted:
+            return False
+        if self.size > 0:
+            return True
+        self._data_event.wait(timeout_ms / 1000.0)
+        return not self.aborted and self.size > 0
 
 
 class SharedMemoryTransportV1:
@@ -237,6 +253,10 @@ class SharedMemoryTransportV1:
         self.epoch = int(epoch)
         self.observations = SharedMemoryRingV1(capacity)
         self.actions = SharedMemoryRingV1(capacity)
+        from .get5_control import CONTROL_EVENT_SIZE
+
+        self.control = SharedMemoryRingV1(capacity)
+        self.control_packet_size = CONTROL_EVENT_SIZE
         self._heartbeat = time.monotonic_ns()
 
     def _check_epoch(self, epoch: int) -> None:
@@ -273,6 +293,28 @@ class SharedMemoryTransportV1:
         self._heartbeat = time.monotonic_ns()
         return batch
 
+    def wait_for_observation(self, timeout_ms: int) -> bool:
+        return self.observations.wait_for_data(timeout_ms)
+
+    def publish_control(self, event: Any) -> int:
+        from .get5_control import Get5ControlEventV1
+
+        payload = event.pack() if isinstance(event, Get5ControlEventV1) else bytes(event)
+        if len(payload) != self.control_packet_size:
+            raise ValueError(f"control event must be {self.control_packet_size} bytes")
+        sequence = self.control.publish(payload)
+        self._heartbeat = time.monotonic_ns()
+        return sequence
+
+    def try_read_control(self) -> Any | None:
+        from .get5_control import Get5ControlEventV1
+
+        packet = self.control.try_read()
+        if packet is None:
+            return None
+        self._heartbeat = time.monotonic_ns()
+        return Get5ControlEventV1.unpack(packet)
+
     def get_heartbeat(self) -> int:
         return self._heartbeat
 
@@ -282,6 +324,7 @@ class SharedMemoryTransportV1:
     def abort(self) -> None:
         self.observations.abort()
         self.actions.abort()
+        self.control.abort()
 
     def switch_epoch(self, epoch: int) -> None:
         if epoch < 0:
@@ -289,6 +332,7 @@ class SharedMemoryTransportV1:
         self.epoch = int(epoch)
         self.observations.reset()
         self.actions.reset()
+        self.control.reset()
         self._heartbeat = time.monotonic_ns()
 
 
@@ -307,7 +351,15 @@ class _Win32SharedMemoryRingV1:
     _FILE_MAP_ALL_ACCESS = 0x000F001F
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-    def __init__(self, name: str, *, epoch: int, capacity: int, packet_size: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        epoch: int,
+        capacity: int,
+        packet_size: int,
+        open_existing: bool = False,
+    ) -> None:
         if os.name != "nt":
             raise RuntimeError("Win32 shared memory requires Windows")
         if not name or not isinstance(name, str):
@@ -321,6 +373,7 @@ class _Win32SharedMemoryRingV1:
         self.name = name
         self.capacity = capacity
         self.packet_size = packet_size
+        self.open_existing = bool(open_existing)
         self.mapping_size = self._HEADER.size + capacity * packet_size
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._configure_api()
@@ -338,6 +391,12 @@ class _Win32SharedMemoryRingV1:
             wintypes.LPCWSTR,
         ]
         self._kernel32.CreateFileMappingW.restype = wintypes.HANDLE
+        self._kernel32.OpenFileMappingW.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        self._kernel32.OpenFileMappingW.restype = wintypes.HANDLE
         self._kernel32.MapViewOfFile.argtypes = [
             wintypes.HANDLE,
             wintypes.DWORD,
@@ -352,8 +411,27 @@ class _Win32SharedMemoryRingV1:
         self._kernel32.CloseHandle.restype = wintypes.BOOL
         self._kernel32.GetTickCount64.argtypes = []
         self._kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        self._sync = ctypes.WinDLL("api-ms-win-core-synch-l1-2-0.dll", use_last_error=True)
+        self._sync.WaitOnAddress.argtypes = [
+            wintypes.LPVOID,
+            wintypes.LPCVOID,
+            ctypes.c_size_t,
+            wintypes.DWORD,
+        ]
+        self._sync.WaitOnAddress.restype = wintypes.BOOL
 
     def _create_mapping(self) -> Any:
+        if self.open_existing:
+            mapping = self._kernel32.OpenFileMappingW(
+                self._FILE_MAP_ALL_ACCESS,
+                False,
+                self.name,
+            )
+            if not mapping:
+                error = ctypes.get_last_error()
+                raise OSError(error, f"OpenFileMappingW failed for {self.name}")
+            self._created = False
+            return mapping
         high = (self.mapping_size >> 32) & 0xFFFFFFFF
         low = self.mapping_size & 0xFFFFFFFF
         mapping = self._kernel32.CreateFileMappingW(
@@ -438,6 +516,10 @@ class _Win32SharedMemoryRingV1:
     def _read_aborted(self) -> int:
         return int(ctypes.c_int32.from_address(self._address + 36).value)
 
+    @property
+    def aborted(self) -> bool:
+        return self._read_aborted() != 0
+
     def current_epoch(self) -> int:
         return self._header()[6] & 0xFFFFFFFF
 
@@ -477,6 +559,23 @@ class _Win32SharedMemoryRingV1:
         self._touch()
         return packet
 
+    def wait_for_data(self, timeout_ms: int) -> bool:
+        if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms < 0:
+            raise ValueError("timeout_ms must be a non-negative integer")
+        if self.aborted:
+            return False
+        write_index = self._read_counter(16)
+        if self._read_counter(24) < write_index:
+            return True
+        compare = ctypes.c_longlong(write_index)
+        self._sync.WaitOnAddress(
+            ctypes.c_void_p(self._address + 16),
+            ctypes.byref(compare),
+            ctypes.sizeof(compare),
+            timeout_ms,
+        )
+        return not self.aborted and self._read_counter(24) < self._read_counter(16)
+
     def abort(self) -> None:
         ctypes.c_int32.from_address(self._address + 36).value = 1
         self._touch()
@@ -513,31 +612,52 @@ class _Win32SharedMemoryRingV1:
 class Win32SharedMemoryTransportV1:
     """Windows named mappings consumed by the SourceMod bridge and CPU service."""
 
-    def __init__(self, name: str, *, capacity: int = 64, epoch: int = 0) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        capacity: int = 64,
+        epoch: int = 0,
+        open_existing: bool = False,
+    ) -> None:
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
         self.name = str(name)
         self.epoch = int(epoch)
+        from .get5_control import CONTROL_EVENT_SIZE
+
         try:
             self.observations = _Win32SharedMemoryRingV1(
                 f"{self.name}_obs_v1",
                 epoch=self.epoch,
                 capacity=capacity,
                 packet_size=ObservationBatchV1(0, 0, ()).packet_size,
+                open_existing=open_existing,
             )
             self.actions = _Win32SharedMemoryRingV1(
                 f"{self.name}_act_v1",
                 epoch=self.epoch,
                 capacity=capacity,
                 packet_size=ActionBatchV1(0, 0, ()).packet_size,
+                open_existing=open_existing,
+            )
+            self.control = _Win32SharedMemoryRingV1(
+                f"{self.name}_ctl_v1",
+                epoch=self.epoch,
+                capacity=capacity,
+                packet_size=CONTROL_EVENT_SIZE,
+                open_existing=open_existing,
             )
         except Exception:
             observations = getattr(self, "observations", None)
             actions = getattr(self, "actions", None)
+            control = getattr(self, "control", None)
             if observations is not None:
                 observations.close()
             if actions is not None:
                 actions.close()
+            if control is not None:
+                control.close()
             raise
 
     def _check_epoch(self, epoch: int) -> None:
@@ -547,9 +667,11 @@ class Win32SharedMemoryTransportV1:
     def refresh_epoch(self) -> int:
         observation_epoch = self.observations.current_epoch()
         action_epoch = self.actions.current_epoch()
-        if observation_epoch != action_epoch:
+        control_epoch = self.control.current_epoch()
+        if observation_epoch != action_epoch or observation_epoch != control_epoch:
             raise ValueError(
-                f"shared memory epoch mismatch: observations={observation_epoch}, actions={action_epoch}"
+                "shared memory epoch mismatch: "
+                f"observations={observation_epoch}, actions={action_epoch}, control={control_epoch}"
             )
         self.epoch = observation_epoch
         return self.epoch
@@ -583,23 +705,50 @@ class Win32SharedMemoryTransportV1:
         self._check_epoch(batch.epoch)
         return batch
 
+    def wait_for_observation(self, timeout_ms: int) -> bool:
+        self.refresh_epoch()
+        return self.observations.wait_for_data(timeout_ms)
+
+    def publish_control(self, event: Any) -> int:
+        from .get5_control import Get5ControlEventV1, CONTROL_EVENT_SIZE
+
+        payload = event.pack() if isinstance(event, Get5ControlEventV1) else bytes(event)
+        if len(payload) != CONTROL_EVENT_SIZE:
+            raise ValueError(f"control event must be {CONTROL_EVENT_SIZE} bytes")
+        return self.control.publish(payload)
+
+    def try_read_control(self) -> Any | None:
+        from .get5_control import Get5ControlEventV1
+
+        packet = self.control.try_read()
+        if packet is None:
+            return None
+        return Get5ControlEventV1.unpack(packet)
+
     def get_heartbeat(self) -> int:
-        return max(self.observations.heartbeat(), self.actions.heartbeat())
+        return max(
+            self.observations.heartbeat(),
+            self.actions.heartbeat(),
+            self.control.heartbeat(),
+        )
 
     def abort(self) -> None:
         self.observations.abort()
         self.actions.abort()
+        self.control.abort()
 
     def switch_epoch(self, epoch: int) -> None:
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
         self.observations.switch_epoch(int(epoch))
         self.actions.switch_epoch(int(epoch))
+        self.control.switch_epoch(int(epoch))
         self.epoch = int(epoch)
 
     def close(self) -> None:
         self.observations.close()
         self.actions.close()
+        self.control.close()
 
     def __enter__(self) -> "Win32SharedMemoryTransportV1":
         return self
@@ -821,6 +970,7 @@ class RuntimeService:
         policy: Callable[..., Any] | Any | None = None,
         model_path: str | Path | None = None,
         max_bots: int = MAX_BOTS,
+        policy_generation: int = 0,
     ) -> None:
         if not 1 <= max_bots <= MAX_BOTS:
             raise ValueError(f"max_bots must be between 1 and {MAX_BOTS}")
@@ -829,12 +979,17 @@ class RuntimeService:
         self.transport = transport
         self.max_bots = max_bots
         self.policy = OnnxCpuPolicy(model_path) if model_path is not None else policy
+        if not isinstance(policy_generation, int) or isinstance(policy_generation, bool) or policy_generation < 0:
+            raise ValueError("policy_generation must be a non-negative integer")
+        self.policy_generation = policy_generation
+        self._pending_policy: tuple[int, Any] | None = None
         self._states = [BotRuntimeStateV1() for _ in range(max_bots)]
         self._entity_states: dict[int, BotRuntimeStateV1] = {}
         self._write_sequence = 0
         self._process_failed = False
         self._failure_reason = ""
         self._round_epoch = transport.epoch
+        self._last_timing: dict[str, int] = {}
 
     @property
     def process_failed(self) -> bool:
@@ -843,6 +998,10 @@ class RuntimeService:
     @property
     def failure_reason(self) -> str:
         return self._failure_reason
+
+    @property
+    def last_timing(self) -> dict[str, int]:
+        return dict(self._last_timing)
 
     def bot_state(self, slot: int) -> BotRuntimeStateV1:
         if not 0 <= slot < self.max_bots:
@@ -865,6 +1024,24 @@ class RuntimeService:
     def begin_round(self, *, epoch: int) -> None:
         self.transport.switch_epoch(epoch)
         self._reset_round_state(epoch)
+
+    def stage_policy_generation(self, model_path: str | Path, generation: int) -> None:
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("policy generation must be a non-negative integer")
+        if generation <= self.policy_generation:
+            raise ValueError("staged policy generation must be newer than the active generation")
+        policy = OnnxCpuPolicy(model_path)
+        self._pending_policy = (generation, policy)
+
+    def activate_policy_generation_at_going_live(self) -> bool:
+        if self._pending_policy is None:
+            return False
+        generation, policy = self._pending_policy
+        self.policy = policy
+        self.policy_generation = generation
+        self._pending_policy = None
+        self._reset_round_state(self._round_epoch)
+        return True
 
     def _reset_round_state(self, epoch: int) -> None:
         self._round_epoch = epoch
@@ -962,6 +1139,7 @@ class RuntimeService:
         actions: list[BotActionV1] = [neutral_action(target_tick) for _ in range(batch.bot_count)]
         active_slots = [slot for slot in range(batch.bot_count) if not self._states[slot].permanent_fallback]
         inferred: Mapping[int, Any] = {}
+        inference_started_ns = time.perf_counter_ns()
         if not self._process_failed and active_slots:
             try:
                 inferred = self._invoke_policy(
@@ -972,6 +1150,7 @@ class RuntimeService:
             except Exception as error:
                 self.mark_process_failed(str(error))
                 inferred = {}
+        inference_completed_ns = time.perf_counter_ns()
         for slot in range(batch.bot_count):
             state = self._states[slot]
             if self._process_failed:
@@ -999,7 +1178,15 @@ class RuntimeService:
             write_sequence=self._write_sequence,
         )
         self._write_sequence += 1
+        publish_started_ns = time.perf_counter_ns()
         self.transport.publish_action(result)
+        publish_completed_ns = time.perf_counter_ns()
+        self._last_timing = {
+            "inference_started_ns": inference_started_ns,
+            "inference_completed_ns": inference_completed_ns,
+            "publish_started_ns": publish_started_ns,
+            "publish_completed_ns": publish_completed_ns,
+        }
         return result
 
     def run(self, stop_event: threading.Event | None = None) -> None:
@@ -1007,10 +1194,14 @@ class RuntimeService:
         while not stop_event.is_set():
             try:
                 self._sync_round_epoch()
+                if not self.transport.wait_for_observation(100):
+                    continue
+                batch = self.transport.try_read_observation()
+            except QueueAborted:
+                return
             except Exception as error:
                 self.mark_process_failed(str(error))
-            batch = self.transport.try_read_observation()
+                continue
             if batch is None:
-                stop_event.wait(0.001)
                 continue
             self.process_observation_batch(batch)

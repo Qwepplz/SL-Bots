@@ -1,0 +1,29 @@
+{
+  "matchid": "{MATCH_ID}",
+  "players_per_team": 5,
+  "num_maps": 1,
+  "skip_veto": true,
+  "maplist": [
+    "de_mirage"
+  ],
+  "team1": {
+    "name": "SLBots-T1",
+    "tag": "SLB1",
+    "players": {}
+  },
+  "team2": {
+    "name": "SLBots-T2",
+    "tag": "SLB2",
+    "players": {}
+  },
+  "cvars": {
+    "mp_maxrounds": "24",
+    "mp_halftime": "1",
+    "mp_match_can_clinch": "1",
+    "mp_overtime_enable": "1",
+    "mp_overtime_maxrounds": "6",
+    "mp_overtime_startmoney": "10000",
+    "get5_demo_name_format": "slbots_{MATCHID}",
+    "tv_enable": "1"
+  }
+}

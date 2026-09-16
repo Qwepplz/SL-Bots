@@ -16,6 +16,7 @@
 namespace {
 
 using sl_bots::ipc::ProtocolHeaderV1;
+using sl_bots::ipc::ControlEventV1;
 
 constexpr std::uint32_t kRingMagic = 0x534C4252u;
 constexpr std::uint32_t kRingVersion = 1;
@@ -91,6 +92,25 @@ bool IsPacketValid(
         packet + sizeof(headerWithoutCrc),
         packetSize - sizeof(headerWithoutCrc));
     return checksum == Crc32(crcInput.data(), crcInput.size());
+}
+
+bool IsControlPacketValid(const std::uint8_t* packet, std::size_t packetSize) {
+    if (packet == nullptr || packetSize != sl_bots::ipc::kControlEventSize) {
+        return false;
+    }
+    const auto* event = reinterpret_cast<const ControlEventV1*>(packet);
+    if (std::memcmp(event->magic, sl_bots::ipc::kControlMagic, sizeof(event->magic)) != 0 ||
+        event->schema_version != sl_bots::ipc::kControlSchemaVersion ||
+        event->event_type == 0 || event->event_type > 14 ||
+        event->reserved[0] != 0 || event->reserved[1] != 0) {
+        return false;
+    }
+    ControlEventV1 eventWithoutCrc = *event;
+    const std::uint32_t checksum = eventWithoutCrc.crc32;
+    eventWithoutCrc.crc32 = 0;
+    return checksum == Crc32(
+        reinterpret_cast<const std::uint8_t*>(&eventWithoutCrc),
+        sizeof(eventWithoutCrc));
 }
 
 std::wstring Utf8ToWide(const char* value) {
@@ -198,6 +218,7 @@ public:
         std::memcpy(slot, packet, packetSize);
         MemoryBarrier();
         InterlockedExchange64(&header_->write_index, static_cast<LONG64>(writeIndex + 1));
+        WakeByAddressAll(static_cast<PVOID>(const_cast<LONG64*>(&header_->write_index)));
         InterlockedExchange64(&header_->heartbeat, static_cast<LONG64>(GetTickCount64()));
         return 1;
     }
@@ -224,6 +245,7 @@ public:
     void Abort() {
         if (Ready()) {
             InterlockedExchange(&header_->aborted, 1);
+            WakeByAddressAll(static_cast<PVOID>(const_cast<LONG64*>(&header_->write_index)));
             InterlockedExchange64(&header_->heartbeat, static_cast<LONG64>(GetTickCount64()));
         }
     }
@@ -236,6 +258,7 @@ public:
         InterlockedExchange64(&header_->read_index, 0);
         InterlockedExchange(&header_->epoch, static_cast<LONG>(epoch));
         InterlockedExchange(&header_->aborted, 0);
+        WakeByAddressAll(static_cast<PVOID>(const_cast<LONG64*>(&header_->write_index)));
         InterlockedExchange64(&header_->heartbeat, static_cast<LONG64>(GetTickCount64()));
         return true;
     }
@@ -267,12 +290,14 @@ public:
         }
         const std::wstring observationName = base + L"_obs_v1";
         const std::wstring actionName = base + L"_act_v1";
+        const std::wstring controlName = base + L"_ctl_v1";
         if (!observations_.Open(
                 observationName,
                 epoch,
                 capacity,
                 sl_bots::ipc::kObservationPacketSize) ||
-            !actions_.Open(actionName, epoch, capacity, sl_bots::ipc::kActionPacketSize)) {
+            !actions_.Open(actionName, epoch, capacity, sl_bots::ipc::kActionPacketSize) ||
+            !control_.Open(controlName, epoch, capacity, sl_bots::ipc::kControlEventSize)) {
             Close();
             return kOpenError;
         }
@@ -282,6 +307,7 @@ public:
     void Close() {
         observations_.Close();
         actions_.Close();
+        control_.Close();
     }
 
     int PublishObservation(const void* packet, std::size_t packetSize) {
@@ -310,22 +336,50 @@ public:
         return 1;
     }
 
+    int PublishControl(const void* packet, std::size_t packetSize) {
+        if (!IsControlPacketValid(static_cast<const std::uint8_t*>(packet), packetSize)) {
+            return kProtocolError;
+        }
+        return control_.Write(packet, packetSize);
+    }
+
+    int TryReadControl(void* packet, std::size_t packetSize) {
+        if (packet == nullptr || packetSize != sl_bots::ipc::kControlEventSize) {
+            return kProtocolError;
+        }
+        std::array<std::uint8_t, sl_bots::ipc::kControlEventSize> local{};
+        const int result = control_.Read(local.data(), local.size());
+        if (result <= 0) {
+            return result;
+        }
+        if (!IsControlPacketValid(local.data(), local.size())) {
+            return kProtocolError;
+        }
+        std::memcpy(packet, local.data(), local.size());
+        return 1;
+    }
+
     int SwitchEpoch(std::uint32_t epoch) {
-        return observations_.SwitchEpoch(epoch) && actions_.SwitchEpoch(epoch) ? 1 : kOpenError;
+        return observations_.SwitchEpoch(epoch) && actions_.SwitchEpoch(epoch) &&
+                control_.SwitchEpoch(epoch) ? 1 : kOpenError;
     }
 
     void Abort() {
         observations_.Abort();
         actions_.Abort();
+        control_.Abort();
     }
 
     std::uint64_t Heartbeat() const {
-        return std::max(observations_.Heartbeat(), actions_.Heartbeat());
+        return std::max(
+            std::max(observations_.Heartbeat(), actions_.Heartbeat()),
+            control_.Heartbeat());
     }
 
 private:
     SharedRing observations_;
     SharedRing actions_;
+    SharedRing control_;
 };
 
 std::mutex g_mutex;
@@ -364,6 +418,20 @@ __declspec(dllexport) int SLBots_TryReadAction(void* packet) noexcept {
     return CurrentTransport() == nullptr ? kOpenError : CurrentTransport()->TryReadAction(
         packet,
         sl_bots::ipc::kActionPacketSize);
+}
+
+__declspec(dllexport) int SLBots_PublishControl(const void* packet) noexcept {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return CurrentTransport() == nullptr ? kOpenError : CurrentTransport()->PublishControl(
+        packet,
+        sl_bots::ipc::kControlEventSize);
+}
+
+__declspec(dllexport) int SLBots_TryReadControl(void* packet) noexcept {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return CurrentTransport() == nullptr ? kOpenError : CurrentTransport()->TryReadControl(
+        packet,
+        sl_bots::ipc::kControlEventSize);
 }
 
 __declspec(dllexport) std::uint32_t SLBots_GetHeartbeat() noexcept {

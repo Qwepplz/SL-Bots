@@ -4,6 +4,9 @@ param(
     [string]$ServerRoot,
     [string]$BridgePlugin = "",
     [string]$IpcExtension = "",
+    [ValidateRange(1, 4)]
+    [int]$InstanceCount = 1,
+    [string]$RunId = "",
     [switch]$RequireRunning
 )
 
@@ -41,6 +44,27 @@ if (-not [string]::IsNullOrWhiteSpace($IpcExtension)) {
     }
 }
 
+$instances = @()
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($RunId)) {
+    for ($index = 1; $index -le $InstanceCount; $index++) {
+        $instanceId = "{0:D2}" -f $index
+        $instancePorts = @(27100 + $index, 27200 + $index, 27300 + $index, 27400 + $index)
+        $ports += $instancePorts
+        $configPath = Join-Path $gameDir "cfg\get5\slbots\$RunId\instance-$instanceId.json"
+        $instances += [pscustomobject]@{
+            instance_id = $instanceId
+            ports = $instancePorts
+            ipc_name = "SLBots_de_mirage_$instanceId"
+            get5_config_path = [IO.Path]::GetFullPath($configPath)
+            get5_config_present = Test-Path -LiteralPath $configPath -PathType Leaf
+        }
+    }
+    if (@($ports | Select-Object -Unique).Count -ne $ports.Count) {
+        throw "专服端口发生冲突"
+    }
+}
+
 $processes = @(Get-Process -Name "srcds" -ErrorAction SilentlyContinue)
 if ($RequireRunning -and $processes.Count -eq 0) {
     throw "要求测试服运行，但未发现 srcds.exe 进程"
@@ -68,5 +92,6 @@ $hashes = foreach ($file in $requiredFiles) {
     map_required = "de_mirage"
     get5_present = $true
     srcds_running = $processes.Count -gt 0
+    instances = @($instances)
     files = @($hashes)
 } | ConvertTo-Json -Depth 4

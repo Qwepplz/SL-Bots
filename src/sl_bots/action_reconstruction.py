@@ -328,6 +328,8 @@ def write_sequence_shard(
     source_manifest: DatasetManifestV1,
     phase: str,
     sequence_ids: Sequence[str] | None = None,
+    human_records: Sequence[Mapping[str, Any]] | None = None,
+    metadata: Mapping[str, str] | None = None,
 ) -> DatasetManifestV1:
     """写入单阶段 Parquet shard，并把源 Demo 与投影版本写入 schema 元数据。"""
 
@@ -353,6 +355,62 @@ def write_sequence_shard(
         normalized_sequence_ids = [str(value) for value in sequence_ids]
         if any(not value for value in normalized_sequence_ids):
             raise ValueError("sequence_ids cannot contain empty values")
+    if human_records is None:
+        normalized_human_records: tuple[Mapping[str, Any], ...] = tuple({} for _ in actions)
+    else:
+        if len(human_records) != len(actions):
+            raise ValueError("human_records and actions must have the same length")
+        normalized_human_records = tuple(human_records)
+        if any(not isinstance(record, Mapping) for record in normalized_human_records):
+            raise TypeError("human_records must contain mappings")
+    absolute_yaws: list[float] = []
+    accumulated_yaw = 0.0
+    for action, record in zip(actions, normalized_human_records):
+        if record.get("yaw_deg") is None:
+            accumulated_yaw += float(action.yaw_delta_deg)
+            absolute_yaws.append(accumulated_yaw)
+        else:
+            absolute_yaws.append(float(record["yaw_deg"]))
+
+    def human_number(record: Mapping[str, Any], name: str, default: float = 0.0) -> float:
+        value = record.get(name, default)
+        if value in (None, ""):
+            return float(default)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"human record {name} must be numeric") from error
+
+    utility_values = []
+    position_x = []
+    position_y = []
+    position_valid = []
+    engagement_distances = []
+    alive_values = []
+    for record in normalized_human_records:
+        utility = record.get("utility", 0)
+        utility_values.append(
+            int(utility not in (None, "", 0, False))
+            if not isinstance(utility, (int, float))
+            else int(utility)
+        )
+        position = record.get("position")
+        valid = bool(record.get("position_valid", position is not None))
+        if position is not None and len(position) >= 2:
+            position_x.append(human_number({"value": position[0]}, "value"))
+            position_y.append(human_number({"value": position[1]}, "value"))
+        else:
+            position_x.append(None)
+            position_y.append(None)
+            valid = False
+        position_valid.append(valid)
+        distance = record.get("engagement_distance")
+        engagement_distances.append(
+            None if distance in (None, "") else human_number({"value": distance}, "value")
+        )
+        alive_values.append(
+            None if record.get("alive") is None else bool(record.get("alive"))
+        )
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -360,7 +418,7 @@ def write_sequence_shard(
         raise RuntimeError("pyarrow is required for sequence Parquet shards") from error
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {
+    schema_metadata = {
         "schema": "SequenceDatasetV1",
         "purpose": source_manifest.effective_purpose().value,
         "phase": phase,
@@ -369,6 +427,8 @@ def write_sequence_shard(
         "projection_version": "ObservationProjectionV1",
         "lineage_parent": source_manifest.name,
     }
+    if metadata:
+        schema_metadata.update({str(key): str(value) for key, value in metadata.items()})
     table = pa.table(
         {
             "observation": pa.array(normalized_observations, type=pa.binary(OBSERVATION_RECORD_SIZE)),
@@ -384,8 +444,15 @@ def write_sequence_shard(
             "buy_action": pa.array([action.buy_action for action in actions], type=pa.int16()),
             "loss_mask": pa.array([action.loss_mask for action in actions], type=pa.uint32()),
             "duration_s": pa.array([action.duration_s for action in actions], type=pa.float32()),
+            "yaw_deg": pa.array(absolute_yaws, type=pa.float32()),
+            "utility": pa.array(utility_values, type=pa.int32()),
+            "position_x": pa.array(position_x, type=pa.float32()),
+            "position_y": pa.array(position_y, type=pa.float32()),
+            "position_valid": pa.array(position_valid, type=pa.bool_()),
+            "engagement_distance": pa.array(engagement_distances, type=pa.float32()),
+            "alive": pa.array(alive_values, type=pa.bool_()),
         }
-    ).replace_schema_metadata({key.encode("utf-8"): value.encode("utf-8") for key, value in metadata.items()})
+    ).replace_schema_metadata({key.encode("utf-8"): value.encode("utf-8") for key, value in schema_metadata.items()})
     pq.write_table(table, output_path, compression="zstd", use_dictionary=False)
     return DatasetManifestV1(
         name=output_path.stem,
@@ -401,5 +468,6 @@ def write_sequence_shard(
             "source_sha256": source_manifest.source_sha256 or "",
             "parser_version": source_manifest.parser_version or "",
             "projection_version": "ObservationProjectionV1",
+            **({str(key): str(value) for key, value in metadata.items()} if metadata else {}),
         },
     )

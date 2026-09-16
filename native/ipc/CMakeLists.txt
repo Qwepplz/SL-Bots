@@ -51,6 +51,7 @@ if (SL_BOTS_ENABLE_SOURCEMOD)
 endif()
 
 if (MSVC)
+    target_link_libraries(sl_bots_ipc PRIVATE synchronization)
     target_compile_options(sl_bots_ipc PRIVATE /W4 /WX /EHsc)
 else()
     target_compile_options(sl_bots_ipc PRIVATE -Wall -Wextra -Werror)
