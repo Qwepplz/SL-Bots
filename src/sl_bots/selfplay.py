@@ -71,6 +71,11 @@ class TransitionBatchV1:
     state_faults: tuple[bool, ...]
     hidden_state_mask: tuple[bool, ...]
     observation_metadata: Mapping[str, str] = field(default_factory=dict)
+    # A decision action/log-probability pair is present only on decision refresh
+    # ticks.  Keeping it in the rollout is required for a real PPO behavior
+    # policy; reconstructing it from the post-hoc actor is not valid.
+    decision_actions: tuple[tuple[int, int, int] | None, ...] = ()
+    decision_log_probs: tuple[float | None, ...] = ()
 
     def __post_init__(self) -> None:
         if self.epoch < 0 or self.server_tick < 0:
@@ -84,6 +89,16 @@ class TransitionBatchV1:
         dones = tuple(bool(value) for value in self.dones)
         state_faults = tuple(bool(value) for value in self.state_faults)
         hidden_state_mask = tuple(bool(value) for value in self.hidden_state_mask)
+        decision_actions = (
+            tuple(self.decision_actions)
+            if self.decision_actions
+            else tuple(None for _ in bot_ids)
+        )
+        decision_log_probs = (
+            tuple(self.decision_log_probs)
+            if self.decision_log_probs
+            else tuple(None for _ in bot_ids)
+        )
         size = len(bot_ids)
         if len(set(bot_ids)) != size:
             raise ValueError("transition bot_ids must be unique")
@@ -93,6 +108,21 @@ class TransitionBatchV1:
             raise ValueError("transition fields must have equal bot counts")
         if len(dones) != size or len(state_faults) != size or len(hidden_state_mask) != size:
             raise ValueError("transition flags must have equal bot counts")
+        if len(decision_actions) != size or len(decision_log_probs) != size:
+            raise ValueError("decision behavior fields must have equal bot counts")
+        for action, log_prob in zip(decision_actions, decision_log_probs):
+            if action is None:
+                if log_prob is not None:
+                    raise ValueError("decision log probability requires a decision action")
+                continue
+            if (
+                not isinstance(action, tuple)
+                or len(action) != 3
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in action)
+            ):
+                raise ValueError("decision action must be a non-negative tactical/task/target tuple")
+            if log_prob is None or not math.isfinite(float(log_prob)):
+                raise ValueError("decision log probability must be finite")
         object.__setattr__(self, "bot_ids", bot_ids)
         object.__setattr__(self, "observations", observations)
         object.__setattr__(self, "actions", actions)
@@ -101,10 +131,16 @@ class TransitionBatchV1:
         object.__setattr__(self, "state_faults", state_faults)
         object.__setattr__(self, "hidden_state_mask", hidden_state_mask)
         object.__setattr__(self, "observation_metadata", dict(self.observation_metadata))
+        object.__setattr__(self, "decision_actions", decision_actions)
+        object.__setattr__(self, "decision_log_probs", decision_log_probs)
 
     @property
     def actor_observations(self) -> tuple[bytes, ...]:
         return self.observations
+
+    @property
+    def has_decision_behavior(self) -> bool:
+        return any(action is not None for action in self.decision_actions)
 
 
 @dataclass(frozen=True)
@@ -148,6 +184,63 @@ class RolloutEnvelopeV1:
         object.__setattr__(self, "critic_path", Path(self.critic_path))
         if self.shard_path.name.endswith(".tmp") or self.critic_path.name.endswith(".tmp"):
             raise ValueError("rollout envelope paths must be atomically completed files")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the stable wire representation used by match manifests."""
+
+        return {
+            "instance_id": self.instance_id,
+            "match_id": self.match_id,
+            "policy_generation": self.policy_generation,
+            "phase": self.phase.name.lower(),
+            "shard_path": str(self.shard_path),
+            "critic_path": str(self.critic_path),
+            "terminal": self.terminal,
+            "truncated": self.truncated,
+        }
+
+
+@dataclass(frozen=True)
+class MatchCompletionV1:
+    """Terminal marker carrying every non-truncated shard of one match."""
+
+    instance_id: str
+    match_id: str
+    policy_generation: int
+    envelopes: tuple[RolloutEnvelopeV1, ...] = ()
+    terminal: bool = True
+
+    def __post_init__(self) -> None:
+        if not str(self.instance_id) or not str(self.match_id):
+            raise ValueError("match completion requires instance_id and match_id")
+        if not isinstance(self.policy_generation, int) or isinstance(self.policy_generation, bool):
+            raise TypeError("match completion policy_generation must be an integer")
+        if self.policy_generation < 0:
+            raise ValueError("match completion policy_generation must be non-negative")
+        if not isinstance(self.terminal, bool) or not self.terminal:
+            raise ValueError("match completion marker must be terminal")
+        envelopes = tuple(self.envelopes)
+        if any(not isinstance(envelope, RolloutEnvelopeV1) for envelope in envelopes):
+            raise TypeError("match completion envelopes must contain RolloutEnvelopeV1 values")
+        for envelope in envelopes:
+            if envelope.instance_id != str(self.instance_id) or envelope.match_id != str(self.match_id):
+                raise ValueError("match completion envelope identity does not match the marker")
+            if envelope.policy_generation != self.policy_generation:
+                raise ValueError("match completion envelope generation does not match the marker")
+            if envelope.truncated:
+                raise ValueError("match completion cannot contain truncated envelopes")
+        object.__setattr__(self, "instance_id", str(self.instance_id))
+        object.__setattr__(self, "match_id", str(self.match_id))
+        object.__setattr__(self, "envelopes", envelopes)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "match_id": self.match_id,
+            "policy_generation": self.policy_generation,
+            "envelopes": [envelope.to_dict() for envelope in self.envelopes],
+            "terminal": True,
+        }
 
 
 class SelfPlayAdapter(Protocol):
@@ -450,6 +543,8 @@ class SharedMemorySelfPlayAdapter:
             "server_tick": action_batch.server_tick,
             "observations": dict(zip(self._bot_ids, observation_batch.observations)),
             "actions": dict(zip(self._bot_ids, action_batch.actions)),
+            "decision_actions": dict(zip(self._bot_ids, action_batch.decision_actions)),
+            "decision_log_probs": dict(zip(self._bot_ids, action_batch.decision_log_probs)),
             "fallback_bots": {
                 bot_id
                 for bot_id, action in zip(self._bot_ids, action_batch.actions)
@@ -487,6 +582,7 @@ class SelfPlayController:
         self.policy_generation = int(policy_generation)
         self.reward_ledger = RewardLedger(reward_weights)
         self._status = "idle"
+        self._match_terminal = False
         self._phase: Phase | None = None
         self._epoch = 0
         self._episode_id = ""
@@ -564,6 +660,18 @@ class SelfPlayController:
     def completed_manifests(self) -> tuple[TrajectoryManifestV1, ...]:
         return tuple(self._completed_manifests)
 
+    @property
+    def completed_envelopes(self) -> tuple[RolloutEnvelopeV1, ...]:
+        """All atomically written, non-truncated shards for the active match."""
+
+        return tuple(self._completed_envelopes)
+
+    @property
+    def match_terminal(self) -> bool:
+        """Whether Get5 has reached a terminal map/series boundary."""
+
+        return self._match_terminal
+
     @staticmethod
     def _load_completed(envelope: RolloutEnvelopeV1) -> Any:
         from .training_mappo import load_rollout_envelope
@@ -592,6 +700,7 @@ class SelfPlayController:
             raise ValueError("epoch must be non-negative")
         self._phase = Phase(phase)
         self._epoch = int(epoch)
+        self._match_terminal = False
         self._episode_id = self._safe_episode_id(episode_id or f"{self._phase.name.lower()}-{self._epoch}")
         self._profiles = normalized
         self._bot_profiles = bot_profiles
@@ -730,6 +839,7 @@ class SelfPlayController:
         if kind in {"map_end", "series_end"} or boundary.terminal:
             if self._batches:
                 self._flush_rollout_segment(terminal=True, boundary=True)
+            self._match_terminal = True
             self._status = "finished"
             self._training_allowed = False
             self._next_hidden_reset = True
@@ -849,6 +959,7 @@ class SelfPlayController:
         self._rollout_shard_index += 1
         self._next_hidden_reset = True
         if terminal:
+            self._match_terminal = True
             self._status = "finished"
             self._training_allowed = False
         return manifest
@@ -951,6 +1062,10 @@ class SelfPlayController:
         done: bool | Mapping[str, bool] = False,
         fallback_bots: set[str] | frozenset[str] | None = None,
         critic_snapshot: CriticSnapshotV1 | Mapping[str, Any] | None = None,
+        decision_actions: Mapping[str, tuple[int, int, int] | None]
+        | Sequence[tuple[int, int, int] | None]
+        | None = None,
+        decision_log_probs: Mapping[str, float | None] | Sequence[float | None] | None = None,
         delta_time_s: float = 1.0 / 128.0,
     ) -> TransitionBatchV1 | None:
         self._require_running()
@@ -975,6 +1090,10 @@ class SelfPlayController:
                 reward_inputs = adapter_data.get("reward_inputs")
             if critic_snapshot is None:
                 critic_snapshot = adapter_data.get("critic_snapshot")
+            if decision_actions is None:
+                decision_actions = adapter_data.get("decision_actions")
+            if decision_log_probs is None:
+                decision_log_probs = adapter_data.get("decision_log_probs")
             if done is False and "done" in adapter_data:
                 done = adapter_data["done"]
         if actions is None:
@@ -984,6 +1103,16 @@ class SelfPlayController:
         bot_ids = self.bot_ids
         action_values = self._align_values(actions, bot_ids, "actions")
         observation_values = self._align_observations(observations, bot_ids)
+        decision_action_values = self._align_values(
+            decision_actions if decision_actions is not None else tuple(None for _ in bot_ids),
+            bot_ids,
+            "decision_actions",
+        )
+        decision_log_prob_values = self._align_values(
+            decision_log_probs if decision_log_probs is not None else tuple(None for _ in bot_ids),
+            bot_ids,
+            "decision_log_probs",
+        )
         fallback = set(fallback_bots or ())
         unknown_fallback = fallback - set(bot_ids)
         if unknown_fallback:
@@ -1021,6 +1150,8 @@ class SelfPlayController:
             state_faults=tuple(state_faults),
             hidden_state_mask=tuple(not fault for fault in state_faults),
             observation_metadata={"schema": TRAJECTORY_SCHEMA_VERSION, "phase": self.phase.name.lower()},
+            decision_actions=tuple(decision_action_values),
+            decision_log_probs=tuple(decision_log_prob_values),
         )
         self._batches.append(batch)
         if self._next_hidden_reset:
@@ -1068,6 +1199,8 @@ class SelfPlayController:
             state_faults=last.state_faults,
             hidden_state_mask=last.hidden_state_mask,
             observation_metadata=last.observation_metadata,
+            decision_actions=last.decision_actions,
+            decision_log_probs=last.decision_log_probs,
         )
 
     def pause(self, reason: str = "technical") -> None:
@@ -1276,6 +1409,21 @@ class SelfPlayController:
                 "done": [batch.dones[index] for batch, index in rows],
                 "state_fault": [batch.state_faults[index] for batch, index in rows],
                 "hidden_state_mask": [batch.hidden_state_mask[index] for batch, index in rows],
+                "decision_action_tactical": [
+                    None if batch.decision_actions[index] is None else batch.decision_actions[index][0]
+                    for batch, index in rows
+                ],
+                "decision_action_task": [
+                    None if batch.decision_actions[index] is None else batch.decision_actions[index][1]
+                    for batch, index in rows
+                ],
+                "decision_action_target": [
+                    None if batch.decision_actions[index] is None else batch.decision_actions[index][2]
+                    for batch, index in rows
+                ],
+                "decision_log_prob": [
+                    batch.decision_log_probs[index] for batch, index in rows
+                ],
             },
             metadata=table_metadata,
         )

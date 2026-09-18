@@ -1,0 +1,27 @@
+purpose: test_only
+map_name: de_mirage
+seed: 7
+max_server_probe: 32
+timescale_candidates: [1, 2, 4, 8]
+server:
+  bot_count: 10
+  no_progress_timeout_seconds: 120
+probe:
+  stable_window_seconds: 20
+  host_timescale_candidates: [1, 2, 4, 8]
+  action_deadline_ms_at_1x: 7.8125
+  require_zero_deadline_miss: true
+selfplay:
+  terminal_condition: get5_match_terminal
+model:
+  decision_hz: 16
+  action_hz: 128
+  decision_memory_tokens: 32
+  decision_model_width: 512
+  action_hidden_size: 384
+  intent_embedding_size: 128
+training:
+  device: cuda
+  sequence_length: 128
+  batch_sequences: 8
+  updates_per_demo: null

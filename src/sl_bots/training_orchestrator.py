@@ -13,7 +13,11 @@ from typing import Any
 
 from .contracts import DataPurpose, ensure_purpose
 from .lineage import DatasetManifestV1
-from .server_farm import build_server_specs
+from .server_farm import (
+    CompleteMatchWaveV1,
+    build_server_specs,
+    collect_single_match_wave,
+)
 from .training_gail import BootstrapMatchV1, build_bootstrap_manifest
 
 
@@ -320,6 +324,9 @@ class TrainingOrchestrator:
         worker_stop: Callable[[], Any] | None = None,
         runtime_stop: Callable[[], Any] | None = None,
         server_stop: Callable[[], Any] | None = None,
+        single_wave_collector: Callable[..., Any] | None = None,
+        single_wave_trainer: Callable[..., Any] | None = None,
+        candidate_exporter: Callable[..., Any] | None = None,
         farm: Any | None = None,
         parent_manifests: Sequence[DatasetManifestV1] = (),
         get5_template_path: str | Path | None = None,
@@ -393,6 +400,9 @@ class TrainingOrchestrator:
         self.worker_stop = worker_stop
         self.runtime_stop = runtime_stop
         self.server_stop = server_stop
+        self.single_wave_collector = single_wave_collector
+        self.single_wave_trainer = single_wave_trainer
+        self.candidate_exporter = candidate_exporter
         self.farm = farm
         self.parent_manifests = tuple(parent_manifests)
         if any(not isinstance(parent, DatasetManifestV1) for parent in self.parent_manifests):
@@ -425,6 +435,8 @@ class TrainingOrchestrator:
         self._pending_completed_segments_by_instance: dict[str, tuple[Any, ...]] = {}
         self._pending_segments_by_match: dict[tuple[str, str], list[Any]] = {}
         self._instance_ids: tuple[str, ...] = ()
+        self._single_wave_executed = False
+        self._single_wave_result: CompleteMatchWaveV1 | None = None
         self._finalized = False
         self._state: dict[str, Any] = {
             "schema": STATE_SCHEMA,
@@ -448,6 +460,8 @@ class TrainingOrchestrator:
             "incomplete": False,
             "incomplete_reason": "",
             "unavailable_instances": {},
+            "single_wave_updates": 0,
+            "candidate_exports": 0,
         }
 
     def _positive_config_float(self, name: str, default: float) -> float:
@@ -969,6 +983,79 @@ class TrainingOrchestrator:
                 raise
         return result
 
+    @property
+    def single_wave_result(self) -> CompleteMatchWaveV1 | None:
+        return self._single_wave_result
+
+    def run_single_match_wave(
+        self,
+        specs: Sequence[Any],
+        package: Any,
+        *,
+        host_timescale: int,
+        ruleset: str = "mr12",
+        match_runner: Callable[..., Any] | None = None,
+        restart_instance: Callable[..., Any] | None = None,
+        watchdog_seconds: float = 120.0,
+        wall_clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        wave_collector: Callable[..., Any] | None = None,
+        mappo_update: Callable[..., Any] | None = None,
+        candidate_exporter: Callable[..., Any] | None = None,
+    ) -> Any:
+        """Run the independent test-only primitive: one wave, one update, one export.
+
+        This method is intentionally separate from ``run_timed_selfplay``.  It has no
+        wall-clock training deadline and never publishes a next generation.  A failed
+        collection returns an aborted wave without exposing any other server's shard.
+        """
+
+        if self.purpose is not DataPurpose.TEST_ONLY:
+            raise ValueError("single match wave is restricted to test_only")
+        if self._single_wave_executed:
+            raise RuntimeError("single match wave already executed")
+        collector = wave_collector or self.single_wave_collector or collect_single_match_wave
+        trainer = mappo_update or self.single_wave_trainer
+        exporter = candidate_exporter or self.candidate_exporter
+        if trainer is None or exporter is None:
+            raise TrainingOrchestratorError(
+                "single match wave requires exactly one MAPPO updater and candidate exporter"
+            )
+        self._single_wave_executed = True
+        if collector is collect_single_match_wave:
+            result = collector(
+                specs,
+                package,
+                host_timescale=host_timescale,
+                ruleset=ruleset,
+                match_runner=match_runner,
+                restart_instance=restart_instance,
+                watchdog_seconds=watchdog_seconds,
+                wall_clock=wall_clock,
+                sleep=sleep,
+            )
+        else:
+            result = _invoke(collector, specs, package, host_timescale)
+        if not isinstance(result, CompleteMatchWaveV1):
+            raise TypeError("single wave collector must return CompleteMatchWaveV1")
+        self._single_wave_result = result
+        self._state["single_wave_status"] = result.status
+        self._state["single_wave_attempts"] = dict(result.attempts)
+        self._state["single_wave_manifests"] = [manifest.to_dict() for manifest in result.manifests]
+        if not result.complete:
+            self._state["phase"] = "single_wave_aborted"
+            self._state["single_wave_abort_reason"] = result.abort_reason
+            self.persist_state(self._deadline)
+            return None
+        update_result = _invoke(trainer, result.shards)
+        self._state["single_wave_updates"] = 1
+        self._state["single_wave_update_payload_count"] = len(result.shards)
+        exported = _invoke(exporter, update_result, result)
+        self._state["candidate_exports"] = 1
+        self._state["phase"] = "single_wave_candidate_exported"
+        self.persist_state(self._deadline)
+        return exported
+
     def stop_accepting_samples(self, cutoff: float | None = None) -> None:
         if self._sampling_stopped:
             return
@@ -1143,8 +1230,10 @@ __all__ = [
     "CALIBRATION_SOAK_SECONDS",
     "CalibrationAttemptV1",
     "CalibrationMetricsV1",
+    "CompleteMatchWaveV1",
     "InstanceUnavailableError",
     "STATE_SCHEMA",
     "TrainingOrchestrator",
     "TrainingOrchestratorError",
+    "collect_single_match_wave",
 ]

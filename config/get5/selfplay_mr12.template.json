@@ -3,6 +3,7 @@
   "players_per_team": 5,
   "num_maps": 1,
   "skip_veto": true,
+  "side_type": "never_knife",
   "maplist": [
     "de_mirage"
   ],
@@ -17,12 +18,21 @@
     "players": {}
   },
   "cvars": {
+    "mp_afterroundmoney": "0",
+    "mp_buytime": "20",
+    "mp_ct_default_primary": "",
+    "mp_ct_default_secondary": "weapon_usp_silencer",
+    "mp_death_drop_gun": "1",
+    "mp_free_armor": "0",
     "mp_maxrounds": "24",
     "mp_halftime": "1",
     "mp_match_can_clinch": "1",
     "mp_overtime_enable": "1",
     "mp_overtime_maxrounds": "6",
     "mp_overtime_startmoney": "10000",
+    "mp_startmoney": "800",
+    "mp_t_default_primary": "",
+    "mp_t_default_secondary": "weapon_glock",
     "get5_demo_name_format": "slbots_{MATCHID}",
     "tv_enable": "1"
   }

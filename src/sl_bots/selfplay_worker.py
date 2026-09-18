@@ -7,7 +7,7 @@ from typing import Any
 from .contracts import Phase
 from .get5_control import Get5ControlState
 from .runtime import QueueAborted
-from .selfplay import RolloutEnvelopeV1, SelfPlayController
+from .selfplay import MatchCompletionV1, RolloutEnvelopeV1, SelfPlayController
 
 
 class SelfPlayWorker:
@@ -33,21 +33,46 @@ class SelfPlayWorker:
         self.wait_timeout_ms = wait_timeout_ms
 
     def run(self, stop_event: Event, rollout_queue: Any, metrics_queue: Any) -> None:
+        pending_controller_boundaries: tuple[Any, ...] = ()
         try:
             while not stop_event.is_set():
                 try:
-                    boundaries = self.control_state.consume_available(self.transport)
-                    self._activate_staged_policy(boundaries)
+                    new_boundaries = self.control_state.consume_available(self.transport)
+                    boundaries = pending_controller_boundaries + new_boundaries
+                    pending_controller_boundaries = ()
+                    self._activate_staged_policy(new_boundaries)
+                    self._apply_runtime_boundaries(new_boundaries)
                     if not self.transport.wait_for_observation(self.wait_timeout_ms):
+                        pending_controller_boundaries = boundaries
                         if self._transport_aborted():
                             break
                         continue
                     read_started_ns = time.perf_counter_ns()
                     observation = self.transport.try_read_observation()
+                    if observation is not None:
+                        # Inference is deliberately latest-state based.  If the
+                        # server produced faster than the model, applying every
+                        # queued packet would publish actions for snapshots that
+                        # have already fallen out of the bridge's identity ring.
+                        observation = self._read_latest_observation(observation)
                     read_completed_ns = time.perf_counter_ns()
+                    late_boundaries = self.control_state.consume_available(self.transport)
+                    if late_boundaries:
+                        self._activate_staged_policy(late_boundaries)
+                        self._apply_runtime_boundaries(late_boundaries)
+                        boundaries += late_boundaries
                 except QueueAborted:
                     break
                 if observation is None:
+                    pending_controller_boundaries = boundaries
+                    continue
+                if self._observation_precedes_round_start(observation, late_boundaries):
+                    # Get5 can report `live` before the engine emits the first
+                    # real round_start.  The bridge resets its snapshot ring at
+                    # that event, so a pre-boundary observation can never accept
+                    # an action packet.  Keep the boundaries for the next valid
+                    # observation and do not train on this stale packet.
+                    pending_controller_boundaries = boundaries
                     continue
                 runtime_started_ns = read_completed_ns
                 try:
@@ -90,6 +115,36 @@ class SelfPlayWorker:
                         )
                     )
                     continue
+                expected_bot_count = len(self.controller.bot_ids)
+                observation_bot_count = len(getattr(observation, "observations", ()))
+                action_bot_count = len(getattr(action, "actions", ())) if action is not None else 0
+                if (
+                    observation_bot_count != expected_bot_count
+                    or action_bot_count != expected_bot_count
+                ):
+                    # CS:GO can publish one or more live snapshots while fake
+                    # clients are still entering/leaving the roster.  Applying
+                    # such a partial batch to a fixed training roster would
+                    # shift bot identities and either corrupt the trajectory
+                    # or raise in SelfPlayController._align_values.  Keep the
+                    # game action path alive, but do not train on the batch.
+                    self.controller.apply_boundaries(boundaries)
+                    metrics_queue.put(
+                        {
+                            "type": "roster_mismatch",
+                            "instance_id": self.controller.instance_id or "default",
+                            "match_id": self.controller.match_id or self.controller.episode_id,
+                            "policy_generation": self.controller.policy_generation,
+                            "server_tick": int(observation.server_tick),
+                            "expected_bot_count": expected_bot_count,
+                            "observation_bot_count": observation_bot_count,
+                            "action_bot_count": action_bot_count,
+                        }
+                    )
+                    if self.controller.status == "finished":
+                        stop_event.set()
+                        break
+                    continue
                 self.controller.accept(observation, action, boundaries)
                 worker_apply_completed_ns = time.perf_counter_ns()
                 for envelope in self.controller.drain_completed(self.rollout_horizon):
@@ -115,8 +170,18 @@ class SelfPlayWorker:
                     stop_event.set()
                     break
         finally:
+            pending_controller_boundaries = ()
             for envelope in self.controller.flush_pending(truncated=True):
                 rollout_queue.put(envelope)
+            if self.controller.match_terminal:
+                rollout_queue.put(
+                    MatchCompletionV1(
+                        instance_id=self.controller.instance_id or "default",
+                        match_id=self.controller.match_id or self.controller.episode_id,
+                        policy_generation=self.controller.policy_generation,
+                        envelopes=self.controller.completed_envelopes,
+                    )
+                )
             close = getattr(self.transport, "close", None)
             if callable(close):
                 close()
@@ -127,6 +192,35 @@ class SelfPlayWorker:
             return
         if any(str(getattr(boundary, "kind", "")) == "going_live" for boundary in boundaries):
             activate()
+
+    def _apply_runtime_boundaries(self, boundaries: tuple[Any, ...]) -> None:
+        apply_boundaries = getattr(self.runtime, "apply_boundaries", None)
+        if callable(apply_boundaries) and boundaries:
+            apply_boundaries(boundaries)
+
+    @staticmethod
+    def _observation_precedes_round_start(observation: Any, boundaries: tuple[Any, ...]) -> bool:
+        for boundary in boundaries:
+            if str(getattr(boundary, "kind", "")) != "round_start":
+                continue
+            try:
+                observation_epoch = int(observation.epoch)
+                boundary_epoch = int(boundary.epoch)
+                observation_tick = int(observation.server_tick)
+                boundary_tick = int(boundary.server_tick)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if observation_epoch != boundary_epoch or observation_tick <= boundary_tick:
+                return True
+        return False
+
+    def _read_latest_observation(self, observation: Any) -> Any:
+        latest = observation
+        while True:
+            candidate = self.transport.try_read_observation()
+            if candidate is None:
+                return latest
+            latest = candidate
 
     def _runtime_timing(self) -> dict[str, int]:
         timing = getattr(self.runtime, "last_timing", {})
@@ -163,6 +257,17 @@ class SelfPlayWorker:
         fallback_count = sum(
             item.action_valid_mask == 0 for item in getattr(action, "actions", ())
         )
+        runtime_metrics: dict[str, Any] = {}
+        metrics_reader = getattr(self.runtime, "metrics", None)
+        if callable(metrics_reader):
+            try:
+                value = metrics_reader()
+                if isinstance(value, dict):
+                    runtime_metrics = value
+            except Exception:
+                runtime_metrics = {}
+        action_percentiles = runtime_metrics.get("action_ms", {})
+        tick_percentiles = runtime_metrics.get("tick_ms", {})
         return {
             "instance_id": self.controller.instance_id or "default",
             "match_id": self.controller.match_id or self.controller.episode_id,
@@ -189,6 +294,25 @@ class SelfPlayWorker:
             "fallback_count": int(fallback_count),
             "source_fallback_count": int(source_fallback_count),
             "runtime_process_failed": bool(getattr(self.runtime, "process_failed", False)),
+            # These snapshots let the capacity probe measure the same worker
+            # runtime that serves each server, instead of substituting one
+            # parent-side ONNX call for N concurrent IPC workers.
+            "runtime_action_p99_ms": float(
+                action_percentiles.get("p99", 0.0)
+                if isinstance(action_percentiles, dict)
+                else 0.0
+            ),
+            "runtime_tick_p99_ms": float(
+                tick_percentiles.get("p99", 0.0)
+                if isinstance(tick_percentiles, dict)
+                else 0.0
+            ),
+            "runtime_total_tick_deadline_miss": int(
+                runtime_metrics.get("total_tick_deadline_miss", 0)
+            ),
+            "runtime_permission_violations": int(
+                runtime_metrics.get("permission_violations", 0)
+            ),
         }
 
 
@@ -196,4 +320,4 @@ def _duration_us(start_ns: int, end_ns: int) -> float:
     return max(0, int(end_ns) - int(start_ns)) / 1000.0
 
 
-__all__ = ["RolloutEnvelopeV1", "SelfPlayWorker"]
+__all__ = ["MatchCompletionV1", "RolloutEnvelopeV1", "SelfPlayWorker"]

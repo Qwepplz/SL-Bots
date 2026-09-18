@@ -12,6 +12,15 @@ class ProductionLineageError(ValueError):
     """Raised when a test-only ancestor reaches a production artifact."""
 
 
+def require_test_only(value: DataPurpose | str) -> DataPurpose:
+    """Require the explicit test-only purpose at an independent test boundary."""
+
+    purpose = ensure_purpose(value)
+    if purpose is not DataPurpose.TEST_ONLY:
+        raise ValueError("test-only pipeline requires test_only purpose")
+    return purpose
+
+
 @dataclass(frozen=True)
 class DatasetManifestV1:
     name: str

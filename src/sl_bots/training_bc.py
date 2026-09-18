@@ -369,3 +369,15 @@ def train_bc(
             "validation_loss": "" if not validation_loss_history else str(validation_loss_history[-1]),
         },
     )
+
+
+def train_hierarchical_step(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Lazy compatibility bridge for the test-only multi-task training path.
+
+    The historical ``train_bc`` entry point remains unchanged; importing this
+    wrapper does not make PyTorch a requirement for the production BC module.
+    """
+
+    from .training_hierarchical import train_hierarchical_step as _train_hierarchical_step
+
+    return _train_hierarchical_step(*args, **kwargs)

@@ -332,9 +332,26 @@ def load_rollout_envelope(envelope: RolloutEnvelopeV1) -> RecurrentRolloutV1:
         value = batch.column(batch.schema.get_field_index(name))[index]
         return value.as_py() if hasattr(value, "as_py") else value
 
+    decision_columns = (
+        "decision_action_tactical",
+        "decision_action_task",
+        "decision_action_target",
+        "decision_log_prob",
+    )
+    present_decision_columns = tuple(
+        name for name in decision_columns if name in trajectory_file.schema.names
+    )
+    if present_decision_columns and len(present_decision_columns) != len(decision_columns):
+        missing_decision = [name for name in decision_columns if name not in present_decision_columns]
+        raise ValueError(
+            "rollout shard has incomplete decision behavior columns: "
+            + ", ".join(missing_decision)
+        )
+    columns = list(required) + list(present_decision_columns)
+
     rows_by_tick: dict[int, list[dict[str, Any]]] = {}
     tick_order: list[int] = []
-    for batch in trajectory_file.iter_batches(batch_size=4096, columns=list(required)):
+    for batch in trajectory_file.iter_batches(batch_size=4096, columns=columns):
         for index in range(batch.num_rows):
             phase = _metadata_phase(row_value(batch, "phase", index))
             if phase is not envelope.phase:
@@ -343,8 +360,7 @@ def load_rollout_envelope(envelope: RolloutEnvelopeV1) -> RecurrentRolloutV1:
             if server_tick not in rows_by_tick:
                 rows_by_tick[server_tick] = []
                 tick_order.append(server_tick)
-            rows_by_tick[server_tick].append(
-                {
+            row = {
                     "phase": phase,
                     "epoch": int(row_value(batch, "epoch", index)),
                     "server_tick": server_tick,
@@ -356,7 +372,26 @@ def load_rollout_envelope(envelope: RolloutEnvelopeV1) -> RecurrentRolloutV1:
                     "state_fault": bool(row_value(batch, "state_fault", index)),
                     "hidden_state_mask": bool(row_value(batch, "hidden_state_mask", index)),
                 }
-            )
+            if present_decision_columns:
+                tactical = row_value(batch, "decision_action_tactical", index)
+                task = row_value(batch, "decision_action_task", index)
+                target = row_value(batch, "decision_action_target", index)
+                log_prob = row_value(batch, "decision_log_prob", index)
+                values = (tactical, task, target)
+                if all(value is None for value in values):
+                    if log_prob is not None:
+                        raise ValueError("rollout decision log probability has no decision action")
+                    row["decision_action"] = None
+                    row["decision_log_prob"] = None
+                elif any(value is None for value in values) or log_prob is None:
+                    raise ValueError("rollout decision behavior row is incomplete")
+                else:
+                    row["decision_action"] = tuple(int(value) for value in values)
+                    row["decision_log_prob"] = float(log_prob)
+            else:
+                row["decision_action"] = None
+                row["decision_log_prob"] = None
+            rows_by_tick[server_tick].append(row)
     transitions: list[TransitionBatchV1] = []
     for server_tick in tick_order:
         tick_rows = rows_by_tick[server_tick]
@@ -375,6 +410,8 @@ def load_rollout_envelope(envelope: RolloutEnvelopeV1) -> RecurrentRolloutV1:
                 dones=tuple(row["done"] for row in tick_rows),
                 state_faults=tuple(row["state_fault"] for row in tick_rows),
                 hidden_state_mask=tuple(row["hidden_state_mask"] for row in tick_rows),
+                decision_actions=tuple(row["decision_action"] for row in tick_rows),
+                decision_log_probs=tuple(row["decision_log_prob"] for row in tick_rows),
             )
         )
 
@@ -443,6 +480,66 @@ def prepare_recurrent_rollouts(
     for rollout in groups:
         rollout.assert_recurrent_boundaries()
     return groups
+
+
+def validate_hierarchical_rollouts(
+    rollouts: Sequence[RecurrentRolloutV1],
+) -> tuple[RecurrentRolloutV1, ...]:
+    """Validate one complete, Demo-only recurrent sequence per server match.
+
+    Actor tensors are deliberately sourced only from ``TransitionBatchV1.actor_observations``;
+    critic snapshots remain a separate shard and are never merged into the actor input schema.
+    """
+
+    try:
+        normalized = prepare_recurrent_rollouts(tuple(rollouts))
+    except ValueError as error:
+        if "policy generations" in str(error):
+            raise ValueError("all hierarchical MAPPO rollouts must use the same Demo-only generation") from error
+        raise
+    if not normalized:
+        raise ValueError("hierarchical MAPPO rollouts cannot be empty")
+    identities = {(item.instance_id, item.match_id) for item in normalized}
+    if len(identities) != len(normalized):
+        raise ValueError("hierarchical MAPPO cannot merge duplicate instance and match sequences")
+    generations = {item.policy_generation for item in normalized}
+    if len(generations) != 1:
+        raise ValueError("all hierarchical MAPPO rollouts must use the same Demo-only generation")
+    for rollout in normalized:
+        if not rollout.terminal or rollout.truncated:
+            raise ValueError("hierarchical MAPPO requires complete terminal rollouts")
+        manifest = rollout.dataset_manifest
+        critic_manifest = rollout.critic_manifest
+        if manifest is None or manifest.effective_purpose() is not DataPurpose.TEST_ONLY:
+            raise ValueError("hierarchical MAPPO rollouts must be Demo-only test_only artifacts")
+        if critic_manifest is None or critic_manifest.effective_purpose() is not DataPurpose.TEST_ONLY:
+            raise ValueError("hierarchical MAPPO critic snapshots must be separate Demo-only shards")
+        generation = str(rollout.policy_generation)
+        for current_manifest in (manifest, critic_manifest):
+            declared_generation = current_manifest.metadata.get("generation")
+            if declared_generation is not None and declared_generation != generation:
+                raise ValueError("hierarchical MAPPO rollout manifest generation does not match policy generation")
+            source = current_manifest.metadata.get("source")
+            if source is not None and source != "demo-only":
+                raise ValueError("hierarchical MAPPO rollouts must use Demo-only source artifacts")
+        for transition in rollout.transitions:
+            if any(len(observation) != 256 for observation in transition.actor_observations):
+                raise ValueError("hierarchical actor rollouts may contain only 256-byte local observations")
+            if len(transition.decision_actions) != len(transition.bot_ids):
+                raise ValueError("hierarchical MAPPO rollouts must carry decision behavior labels")
+            if len(transition.decision_log_probs) != len(transition.bot_ids):
+                raise ValueError("hierarchical MAPPO rollouts must carry decision behavior log probabilities")
+            for action, log_prob in zip(
+                transition.decision_actions,
+                transition.decision_log_probs,
+            ):
+                if action is None and log_prob is None:
+                    continue
+                if action is None or log_prob is None or not math.isfinite(float(log_prob)):
+                    raise ValueError("hierarchical MAPPO rollout decision behavior is incomplete")
+        if not any(transition.has_decision_behavior for transition in rollout.transitions):
+            raise ValueError("hierarchical MAPPO rollouts contain no sampled decision actions")
+    return normalized
 
 
 def _snapshot_value(snapshot: CriticSnapshotV1 | None, bot_id: str) -> float:

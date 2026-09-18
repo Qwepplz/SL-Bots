@@ -230,8 +230,12 @@ def read_raw_ticks(path: str | Path) -> tuple[RawTickV1, ...]:
 
 def _under_demo_root(path: Path) -> bool:
     demo_root = Path("E:/Demo").resolve()
+    return _under_root(path, demo_root)
+
+
+def _under_root(path: Path, root: Path) -> bool:
     try:
-        path.relative_to(demo_root)
+        path.resolve().relative_to(root.resolve())
     except ValueError:
         return False
     return True
@@ -275,14 +279,21 @@ def ingest_demo(
     *,
     extractor_path: str | Path | None = None,
     allow_header_only: bool = False,
+    demo_root: str | Path | None = None,
 ) -> DatasetManifestV1:
     source = Path(path).resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
     requested_purpose = ensure_purpose(purpose)
-    if _under_demo_root(source) and requested_purpose is DataPurpose.PRODUCTION:
+    resolved_demo_root = Path(demo_root).resolve() if demo_root is not None else None
+    if resolved_demo_root is not None and not _under_root(source, resolved_demo_root):
+        raise ValueError("source demo must be located under demo_root")
+    is_test_demo = _under_demo_root(source) or (
+        resolved_demo_root is not None and _under_root(source, resolved_demo_root)
+    )
+    if is_test_demo and requested_purpose is DataPurpose.PRODUCTION:
         raise ProductionLineageError("E:/Demo inputs are always test_only")
-    effective_purpose = DataPurpose.TEST_ONLY if _under_demo_root(source) else requested_purpose
+    effective_purpose = DataPurpose.TEST_ONLY if is_test_demo else requested_purpose
     header = read_demo_header(source)
     if header.map_name != "de_mirage":
         raise ValueError("only de_mirage is supported")

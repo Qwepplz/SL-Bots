@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -12,7 +12,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .action_reconstruction import ActionLabelV1, reconstruct_action, write_sequence_shard
+from .action_reconstruction import IN_SPEED, ActionLabelV1, reconstruct_action, write_sequence_shard
 from .contracts import DataPurpose, Phase, ensure_purpose
 from .demo_pipeline import (
     DemoCorpusEntryV1,
@@ -41,6 +41,15 @@ _REQUIRED_COLUMNS = (
     "loss_mask",
     "duration_s",
 )
+_OPTIONAL_COLUMNS = (
+    "yaw_deg",
+    "utility",
+    "position_x",
+    "position_y",
+    "position_valid",
+    "engagement_distance",
+    "alive",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +60,8 @@ class RecurrentMiniBatchV1:
     duration_s: Any
     hidden_state_mask: Any
     sequence_ids: tuple[tuple[str, ...], ...]
+    target_ticks: Any | None = None
+    context: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def batch_size(self) -> int:
@@ -64,6 +75,11 @@ class RecurrentMiniBatchV1:
             loss_masks=self.loss_masks.to(device),
             duration_s=self.duration_s.to(device),
             hidden_state_mask=self.hidden_state_mask.to(device),
+            target_ticks=None if self.target_ticks is None else self.target_ticks.to(device),
+            context={
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in self.context.items()
+            },
         )
 
 
@@ -97,11 +113,15 @@ def _iter_rows(path: Path, batch_size: int) -> Iterator[dict[str, Any]]:
     missing = [name for name in _REQUIRED_COLUMNS if name not in parquet_file.schema.names]
     if missing:
         raise ValueError(f"sequence shard is missing columns: {', '.join(missing)}")
-    for batch in parquet_file.iter_batches(batch_size=max(1, batch_size), columns=list(_REQUIRED_COLUMNS)):
+    available_columns = tuple(
+        name for name in (*_REQUIRED_COLUMNS, *_OPTIONAL_COLUMNS)
+        if name in parquet_file.schema.names
+    )
+    for batch in parquet_file.iter_batches(batch_size=max(1, batch_size), columns=list(available_columns)):
         for index in range(batch.num_rows):
             yield {
                 name: _row_value(batch, name, index)
-                for name in _REQUIRED_COLUMNS
+                for name in available_columns
             }
 
 
@@ -122,8 +142,19 @@ def _normalize_window(rows: Sequence[Mapping[str, Any]], sequence_length: int) -
     observations = torch.zeros((sequence_length, batch_size, 256), dtype=torch.float32)
     actions = torch.zeros((sequence_length, batch_size, _ACTION_WIDTH), dtype=torch.float32)
     loss_masks = torch.zeros((sequence_length, batch_size), dtype=torch.int64)
+    target_ticks = torch.zeros((sequence_length, batch_size), dtype=torch.int64)
     duration_s = torch.full((sequence_length, batch_size), 1.0 / 128.0, dtype=torch.float32)
     hidden_state_mask = torch.zeros((sequence_length, batch_size), dtype=torch.bool)
+    context: dict[str, Any] = {
+        "yaw_deg": torch.zeros((sequence_length, batch_size), dtype=torch.float32),
+        "utility": torch.zeros((sequence_length, batch_size), dtype=torch.float32),
+        "position_xy": torch.zeros((sequence_length, batch_size, 2), dtype=torch.float32),
+        "position_valid": torch.zeros((sequence_length, batch_size), dtype=torch.bool),
+        "engagement_distance": torch.full(
+            (sequence_length, batch_size), float("nan"), dtype=torch.float32
+        ),
+        "alive": torch.ones((sequence_length, batch_size), dtype=torch.bool),
+    }
     sequence_ids: list[str] = []
     for batch_index, row_group in enumerate(rows):
         sequence_id = str(row_group[0]["sequence_id"])
@@ -150,8 +181,34 @@ def _normalize_window(rows: Sequence[Mapping[str, Any]], sequence_length: int) -
                 dtype=torch.float32,
             )
             loss_masks[time_index, batch_index] = int(row["loss_mask"])
+            target_ticks[time_index, batch_index] = int(row.get("target_tick", 0) or 0)
             duration_s[time_index, batch_index] = max(float(row["duration_s"]), 1.0 / 128.0)
             hidden_state_mask[time_index, batch_index] = time_index > 0
+            context["yaw_deg"][time_index, batch_index] = float(row.get("yaw_deg") or 0.0)
+            context["utility"][time_index, batch_index] = float(row.get("utility") or 0.0)
+            position_x = row.get("position_x")
+            position_y = row.get("position_y")
+            if position_x is not None and position_y is not None:
+                context["position_xy"][time_index, batch_index] = torch.tensor(
+                    [float(position_x), float(position_y)], dtype=torch.float32
+                )
+            context["position_valid"][time_index, batch_index] = bool(
+                row.get("position_valid", position_x is not None and position_y is not None)
+            )
+            distance = row.get("engagement_distance")
+            if distance is not None:
+                context["engagement_distance"][time_index, batch_index] = float(distance)
+            alive = row.get("alive")
+            if alive is not None:
+                context["alive"][time_index, batch_index] = bool(alive)
+    # Older sequence shards were generated before the walking UserCmd bit was
+    # represented by the action labeler.  The observation contract still
+    # carries self_flags.is_walking at byte 26, so recover IN_SPEED at load
+    # time without rewriting or duplicating the canonical Parquet corpus.
+    self_flags = torch.round(observations[:, :, 26] * 255.0).to(torch.int64)
+    walking = (self_flags & (1 << 2)) != 0
+    buttons = actions[:, :, 5].to(torch.int64)
+    actions[:, :, 5] = (buttons | walking.to(torch.int64) * IN_SPEED).to(torch.float32)
     time_major_ids = tuple(tuple(sequence_ids[index] for index in range(batch_size)) for _ in range(sequence_length))
     return RecurrentMiniBatchV1(
         observations=observations,
@@ -160,6 +217,8 @@ def _normalize_window(rows: Sequence[Mapping[str, Any]], sequence_length: int) -
         duration_s=duration_s,
         hidden_state_mask=hidden_state_mask,
         sequence_ids=time_major_ids,
+        target_ticks=target_ticks,
+        context=context,
     )
 
 
@@ -183,19 +242,87 @@ def _path_windows(path: Path, sequence_length: int) -> Iterator[list[dict[str, A
         yield current
 
 
+def _window_has_action_signal(window: Sequence[Mapping[str, Any]]) -> bool:
+    """Identify windows that contain a non-neutral discrete action."""
+
+    for row in window:
+        try:
+            if int(row.get("buttons", 0) or 0) != 0:
+                return True
+            if int(row.get("weapon_select", -1) or -1) != -1:
+                return True
+            if int(row.get("buy_action", 0) or 0) != 0:
+                return True
+            if float(row.get("utility", 0.0) or 0.0) > 0.0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _bounded_path_windows(
+    path: Path,
+    sequence_length: int,
+    *,
+    limit: int | None,
+    rng: random.Random,
+) -> Iterator[list[dict[str, Any]]]:
+    if limit is None:
+        yield from _path_windows(path, sequence_length)
+        return
+    if limit <= 0:
+        raise ValueError("max_windows_per_path must be positive when specified")
+    priority_reservoir: list[list[dict[str, Any]]] = []
+    normal_reservoir: list[list[dict[str, Any]]] = []
+    priority_seen = 0
+    normal_seen = 0
+    for window in _path_windows(path, sequence_length):
+        if _window_has_action_signal(window):
+            priority_seen += 1
+            if len(priority_reservoir) < limit:
+                priority_reservoir.append(window)
+            else:
+                replacement = rng.randrange(priority_seen)
+                if replacement < limit:
+                    priority_reservoir[replacement] = window
+            continue
+        normal_seen += 1
+        if len(normal_reservoir) < limit:
+            normal_reservoir.append(window)
+        else:
+            replacement = rng.randrange(normal_seen)
+            if replacement < limit:
+                normal_reservoir[replacement] = window
+    reservoir = priority_reservoir[:limit]
+    if len(reservoir) < limit:
+        reservoir.extend(normal_reservoir[: limit - len(reservoir)])
+    rng.shuffle(reservoir)
+    yield from reservoir
+
+
 def iter_recurrent_minibatches(
     paths: Sequence[Path],
     sequence_length: int,
     batch_sequences: int,
     seed: int,
+    *,
+    max_windows_per_path: int | None = None,
 ) -> Iterator[RecurrentMiniBatchV1]:
     if sequence_length <= 0 or batch_sequences <= 0:
         raise ValueError("sequence_length and batch_sequences must be positive")
+    if max_windows_per_path is not None and max_windows_per_path <= 0:
+        raise ValueError("max_windows_per_path must be positive when specified")
     ordered_paths = [Path(path).resolve() for path in paths]
     random.Random(seed).shuffle(ordered_paths)
     pending: list[list[dict[str, Any]]] = []
-    for path in ordered_paths:
-        for window in _path_windows(path, sequence_length):
+    for path_index, path in enumerate(ordered_paths):
+        path_rng = random.Random(seed + path_index * 1_000_003)
+        for window in _bounded_path_windows(
+            path,
+            sequence_length,
+            limit=max_windows_per_path,
+            rng=path_rng,
+        ):
             pending.append(window)
             if len(pending) == batch_sequences:
                 yield _normalize_window(pending, sequence_length)
@@ -443,6 +570,16 @@ def ingest_demo_corpus(
     allow_header_only: bool = False,
 ) -> DatasetManifestV1:
     requested_purpose = ensure_purpose(purpose)
+    input_root = Path(input_root).resolve()
+    root = Path(data_root).resolve()
+    try:
+        root.relative_to(input_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("data root must be outside the read-only demo root")
+    if requested_purpose is DataPurpose.TEST_ONLY and expected_count != 10:
+        raise ValueError("test-only corpus requires exactly 10 Mirage demos")
     entries = tuple(sorted(discover_demo_headers(input_root), key=lambda item: item.sha256))
     mirage = tuple(entry for entry in entries if entry.header.map_name == "de_mirage")
     if len(mirage) != expected_count:
@@ -450,7 +587,6 @@ def ingest_demo_corpus(
     hashes = [entry.sha256 for entry in mirage]
     if len(set(hashes)) != len(hashes):
         raise ValueError("Mirage Demo SHA-256 values must be unique")
-    root = Path(data_root).resolve()
     sequence_root = root / "sequences"
     split_entries = {
         "train": mirage[:8],
@@ -485,8 +621,15 @@ def ingest_demo_corpus(
         "ruleset": "mr15",
         "regulation_max_rounds": "30",
         "expected_demo_count": str(expected_count),
-        "splits_json": json.dumps(list(split_entries), separators=(",", ":")),
-        "input_root": str(Path(input_root).resolve()),
+        "splits_json": json.dumps(
+            {
+                split: [entry.sha256 for entry in split_values]
+                for split, split_values in split_entries.items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "input_root": str(input_root),
         "corpus_sha256": sha256("".join(hashes).encode("ascii")).hexdigest(),
     }
     for split, paths in split_paths.items():

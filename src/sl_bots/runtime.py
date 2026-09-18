@@ -21,8 +21,14 @@ from .contracts import (
     ActionBatchV1,
     BotActionV1,
     BotObservationV1,
+    INTENT_TASKS,
+    IntentV1,
+    Phase,
+    TACTICAL_MODES,
+    TARGET_SLOT_NONE,
     ObservationBatchV1,
 )
+from .intent import canonicalize_intent, guard_action, guard_friendly_fire
 
 
 ACTION_MASK_ALL = 0xFF
@@ -41,6 +47,7 @@ def _action_from_onnx_outputs(
     mouse_scale: Sequence[float] | None = None,
     mouse_mix_logits: Sequence[Sequence[float]] | None = None,
     random_seed: int | None = None,
+    sample_distributions: bool | None = None,
 ) -> BotActionV1:
     if len(action_vector) < 5:
         raise ValueError("ONNX action output must contain five continuous values")
@@ -55,8 +62,8 @@ def _action_from_onnx_outputs(
         math.isfinite(float(value)) for value in buy_logits
     ):
         raise ValueError("ONNX categorical action output must be finite")
-    distribution_sampling = movement_alpha is not None or movement_beta is not None
-    if distribution_sampling:
+    has_movement_distribution = movement_alpha is not None or movement_beta is not None
+    if has_movement_distribution:
         if movement_alpha is None or movement_beta is None:
             raise ValueError("ONNX movement distribution outputs must be provided together")
         if len(movement_alpha) != 3 or len(movement_beta) != 3:
@@ -66,6 +73,9 @@ def _action_from_onnx_outputs(
             for value in (*movement_alpha, *movement_beta)
         ):
             raise ValueError("ONNX movement distribution outputs must be finite and positive")
+    distribution_sampling = (
+        has_movement_distribution if sample_distributions is None else bool(sample_distributions)
+    )
     rng = random.Random(server_tick if random_seed is None else random_seed)
     mouse_values = continuous[3:5]
     if any(value is not None for value in (mouse_loc, mouse_scale, mouse_mix_logits)):
@@ -960,6 +970,750 @@ class OnnxCpuPolicy:
         return actions
 
 
+@dataclass
+class HierarchicalRuntimeStateV1:
+    """Numpy runtime state kept independently for each Bot slot."""
+
+    observation_history: Any
+    decision_memory: Any
+    action_hidden: Any
+    cached_intent: Any
+    intent: IntentV1 = field(default_factory=IntentV1)
+    last_decision_tick: int = -1
+    reflection_request_tick: int | None = None
+
+
+def decision_output_to_intent_embedding_numpy(
+    output: Mapping[str, Any],
+    index: int,
+    *,
+    labels: tuple[int, int, int] | None = None,
+) -> Any:
+    """Encode ONNX decision heads using the canonical IntentV1 contract."""
+
+    import numpy as np
+
+    def row(name: str) -> Any:
+        values = np.asarray(output[name], dtype=np.float32)
+        if values.ndim == 0 or index < 0 or index >= values.shape[0]:
+            raise ValueError(f"decision output {name} does not contain batch index {index}")
+        return values[index]
+
+    if labels is None:
+        labels = (
+            int(row("tactical_mode_logits").argmax()),
+            int(row("task_logits").argmax()),
+            int(row("target_slot_logits").argmax()),
+        )
+    if len(labels) != 3:
+        raise ValueError("intent labels must contain tactical, task and target classes")
+    if not 0 <= int(labels[0]) < len(TACTICAL_MODES):
+        raise ValueError("tactical intent label is outside the decision head range")
+    if not 0 <= int(labels[1]) < len(INTENT_TASKS):
+        raise ValueError("task intent label is outside the decision head range")
+    if not 0 <= int(labels[2]) <= TARGET_SLOT_NONE:
+        raise ValueError("target intent label is outside the decision head range")
+    intent = canonicalize_intent(
+        {
+            "tactical_mode": TACTICAL_MODES[int(labels[0])],
+            "task": INTENT_TASKS[int(labels[1])],
+            "goal_position": row("goal_position"),
+            "waypoint_position": row("waypoint_position"),
+            "facing_yaw_pitch": row("facing_yaw_pitch"),
+            "desired_range": row("desired_range"),
+            "target_slot": int(labels[2]),
+            "aggression": row("aggression"),
+            "risk": row("risk"),
+            "priority": row("priority"),
+            "ttl_ticks": row("ttl_ticks"),
+            "confidence": {"all": 1.0},
+            "valid_mask": {
+                "buy_action": False,
+                "utility_action": int(labels[1]) == INTENT_TASKS.index("use_utility"),
+                "weapon_select": True,
+            },
+        }
+    )
+    return np.asarray(intent.to_embedding(128), dtype=np.float32)
+
+
+class HierarchicalRuntimeService:
+    """CPU double-session runtime for the 16 Hz decision/128 Hz action split."""
+
+    def __init__(
+        self,
+        *,
+        decision_session: Any | None = None,
+        action_session: Any | None = None,
+        decision_model_path: str | Path | None = None,
+        action_model_path: str | Path | None = None,
+        max_bots: int = MAX_BOTS,
+        tick_deadline_ms: float = 1000.0 / 128.0,
+        stochastic_actions: bool = False,
+        stochastic_decisions: bool = False,
+    ) -> None:
+        if not 1 <= max_bots <= MAX_BOTS:
+            raise ValueError(f"max_bots must be between 1 and {MAX_BOTS}")
+        if decision_session is not None and decision_model_path is not None:
+            raise ValueError("provide decision_session or decision_model_path, not both")
+        if action_session is not None and action_model_path is not None:
+            raise ValueError("provide action_session or action_model_path, not both")
+        if decision_session is None:
+            decision_session = self._load_cpu_session(decision_model_path, "decision_model_path")
+        if action_session is None:
+            action_session = self._load_cpu_session(action_model_path, "action_model_path")
+        if decision_session is action_session:
+            raise ValueError("decision and action must use independent ONNX Runtime sessions")
+        if tick_deadline_ms <= 0.0:
+            raise ValueError("tick_deadline_ms must be positive")
+        if not isinstance(stochastic_actions, bool):
+            raise TypeError("stochastic_actions must be a boolean")
+        if not isinstance(stochastic_decisions, bool):
+            raise TypeError("stochastic_decisions must be a boolean")
+        import numpy as np
+
+        self._np = np
+        self.decision_session = decision_session
+        self.action_session = action_session
+        self.max_bots = max_bots
+        self.tick_deadline_ms = float(tick_deadline_ms)
+        self.stochastic_actions = stochastic_actions
+        self.stochastic_decisions = stochastic_decisions
+        self._decision_input_names = tuple(item.name for item in decision_session.get_inputs())
+        self._decision_output_names = tuple(item.name for item in decision_session.get_outputs())
+        self._action_input_names = tuple(item.name for item in action_session.get_inputs())
+        self._action_output_names = tuple(item.name for item in action_session.get_outputs())
+        self._states = [self._new_state() for _ in range(max_bots)]
+        self._last_tick = -1
+        self._decision_latency_ms: list[float] = []
+        self._action_latency_ms: list[float] = []
+        self._tick_latency_ms: list[float] = []
+        self._last_action_elapsed_ms = 0.0
+        self._deadline_miss_count = 0
+        self._permission_violations = 0
+        self._last_decision_actions: tuple[tuple[int, int, int] | None, ...] = tuple(
+            None for _ in range(max_bots)
+        )
+        self._last_decision_log_probs: tuple[float | None, ...] = tuple(
+            None for _ in range(max_bots)
+        )
+
+    @staticmethod
+    def _load_cpu_session(model_path: str | Path | None, name: str) -> Any:
+        if model_path is None:
+            raise ValueError(f"{name} is required when a session is not supplied")
+        try:
+            import onnxruntime as ort
+        except ImportError as error:  # pragma: no cover - dependency boundary
+            raise RuntimeError("onnxruntime is required for hierarchical runtime") from error
+        session_options = ort.SessionOptions()
+        # The action branch runs at 128 Hz and is intentionally a small batch.
+        # A large ORT thread pool adds scheduling jitter across the game server
+        # and multiple farm instances, so use deterministic sequential CPU
+        # execution for both independent hierarchical sessions.
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session = ort.InferenceSession(
+            str(Path(model_path)),
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
+        )
+        providers = tuple(session.get_providers()) if hasattr(session, "get_providers") else ()
+        if providers and providers != ("CPUExecutionProvider",):
+            raise RuntimeError("hierarchical runtime must use independent CPU ONNX sessions")
+        return session
+
+    def _new_state(self) -> HierarchicalRuntimeStateV1:
+        return HierarchicalRuntimeStateV1(
+            observation_history=self._np.zeros((32, 256), dtype=self._np.float32),
+            decision_memory=self._np.zeros((32, 512), dtype=self._np.float32),
+            action_hidden=self._np.zeros((384,), dtype=self._np.float32),
+            cached_intent=self._np.zeros((128,), dtype=self._np.float32),
+        )
+
+    def bot_state(self, slot: int) -> HierarchicalRuntimeStateV1:
+        if not 0 <= slot < self.max_bots:
+            raise IndexError(f"bot slot must be between 0 and {self.max_bots - 1}")
+        return self._states[slot]
+
+    def _reset_states(self) -> None:
+        self._states = [self._new_state() for _ in range(self.max_bots)]
+        self._last_tick = -1
+        self._last_decision_actions = tuple(None for _ in range(self.max_bots))
+        self._last_decision_log_probs = tuple(None for _ in range(self.max_bots))
+
+    def reset_round(self) -> None:
+        self._reset_states()
+
+    def begin_round(self) -> None:
+        self.reset_round()
+
+    def change_side(self) -> None:
+        self._reset_states()
+
+    def end_match(self) -> None:
+        self._reset_states()
+
+    def backup_state(self) -> list[HierarchicalRuntimeStateV1]:
+        import copy
+
+        return copy.deepcopy(self._states)
+
+    def restore_backup(self, backup: Sequence[HierarchicalRuntimeStateV1]) -> None:
+        import copy
+
+        if len(backup) != self.max_bots:
+            raise ValueError("hierarchical runtime backup does not match max_bots")
+        self._states = copy.deepcopy(list(backup))
+        self._last_tick = max((state.last_decision_tick for state in self._states), default=-1)
+
+    def request_reflection(self, slot: int, *, requested_at_tick: int | None = None) -> None:
+        state = self.bot_state(slot)
+        tick = self._last_tick if requested_at_tick is None else int(requested_at_tick)
+        if tick < 0:
+            raise ValueError("reflection request needs a non-negative tick")
+        state.reflection_request_tick = tick
+
+    @staticmethod
+    def _append_observation(state: HierarchicalRuntimeStateV1, observation: BotObservationV1, np: Any) -> Any:
+        values = np.frombuffer(observation.to_bytes(), dtype=np.uint8).astype(np.float32) / 255.0
+        state.observation_history[:-1] = state.observation_history[1:]
+        state.observation_history[-1] = values
+        return values
+
+    @staticmethod
+    def _decision_to_intent(
+        output: Mapping[str, Any],
+        index: int,
+        labels: tuple[int, int, int] | None = None,
+        *,
+        buy_allowed: bool = True,
+    ) -> IntentV1:
+        if labels is None:
+            labels = (
+                int(output["tactical_mode_logits"][index].argmax()),
+                int(output["task_logits"][index].argmax()),
+                int(output["target_slot_logits"][index].argmax()),
+            )
+        mode = TACTICAL_MODES[int(labels[0])]
+        task = INTENT_TASKS[int(labels[1])]
+        target_slot = int(labels[2])
+        if target_slot > TARGET_SLOT_NONE:
+            target_slot = TARGET_SLOT_NONE
+        valid_mask = {
+            # The bridge enforces the actual buy phase.  The intent layer must
+            # not permanently disable the buy head before that deployment
+            # boundary gets a chance to apply its phase rules.
+            "buy_action": bool(buy_allowed),
+            "utility_action": task == "use_utility",
+            "weapon_select": True,
+        }
+        return canonicalize_intent(
+            {
+                "tactical_mode": mode,
+                "task": task,
+                "goal_position": output["goal_position"][index],
+                "waypoint_position": output["waypoint_position"][index],
+                "facing_yaw_pitch": output["facing_yaw_pitch"][index],
+                "desired_range": output["desired_range"][index],
+                "target_slot": target_slot,
+                "aggression": output["aggression"][index],
+                "risk": output["risk"][index],
+                "priority": output["priority"][index],
+                "ttl_ticks": output["ttl_ticks"][index],
+                "confidence": {"all": 1.0},
+                "valid_mask": valid_mask,
+            }
+        )
+
+    @staticmethod
+    def _buy_allowed(observation: BotObservationV1) -> bool:
+        """Allow the buy head on a valid Get5 phase; the bridge gates the buy window."""
+
+        try:
+            from .observation_projection import decode_observation
+
+            phase = decode_observation(observation).phase
+        except (TypeError, ValueError, struct.error):
+            return False
+        # CS:GO exposes round freezetime through the live phase in this wire
+        # contract.  The SourcePawn bridge suppresses/duplicates buy commands
+        # according to the actual engine window, so disabling the head for all
+        # LIVE observations would make normal round purchases impossible.
+        return phase in {Phase.WARMUP, Phase.KNIFE, Phase.LIVE}
+
+    def _run_decision(
+        self,
+        slots: Sequence[int],
+        server_tick: int,
+        observations: Sequence[BotObservationV1] | None = None,
+    ) -> None:
+        if not slots:
+            return
+        np = self._np
+        observation_history = np.stack([self._states[slot].observation_history for slot in slots])
+        previous_intent = np.stack([self._states[slot].cached_intent for slot in slots])
+        memory = np.stack([self._states[slot].decision_memory for slot in slots])
+        feed = {
+            self._decision_input_names[0]: observation_history,
+            self._decision_input_names[1]: previous_intent,
+            self._decision_input_names[2]: memory,
+        }
+        started = time.perf_counter_ns()
+        values = self.decision_session.run(None, feed)
+        completed = time.perf_counter_ns()
+        self._decision_latency_ms.append((completed - started) / 1_000_000.0)
+        output = dict(zip(self._decision_output_names, values))
+        required = {
+            "tactical_mode_logits",
+            "task_logits",
+            "goal_position",
+            "waypoint_position",
+            "facing_yaw_pitch",
+            "desired_range",
+            "target_slot_logits",
+            "aggression",
+            "risk",
+            "priority",
+            "ttl_ticks",
+        }
+        if not required.issubset(output):
+            raise ValueError("decision session does not expose the structured intent outputs")
+        decision_actions = list(self._last_decision_actions)
+        decision_log_probs = list(self._last_decision_log_probs)
+        for local_index, slot in enumerate(slots):
+            state = self._states[slot]
+            tactical_logits = np.asarray(output["tactical_mode_logits"][local_index], dtype=np.float64)
+            task_logits = np.asarray(output["task_logits"][local_index], dtype=np.float64)
+            target_logits = np.asarray(output["target_slot_logits"][local_index], dtype=np.float64)
+            logits_by_head = (tactical_logits, task_logits, target_logits)
+
+            if self.stochastic_decisions:
+                # Rollouts used by MAPPO must record the probability under the
+                # policy that actually selected the action.  Keep sampling
+                # reproducible per Bot/Tick so replay and diagnostics remain
+                # deterministic while still representing a categorical policy.
+                rng = np.random.default_rng(
+                    int(server_tick) * 1009 + int(slot) * 9176 + 0x5EED
+                )
+                sampled: list[int] = []
+                log_prob = 0.0
+                for logits in logits_by_head:
+                    shifted = logits - np.max(logits)
+                    probabilities = np.exp(shifted)
+                    probabilities /= np.sum(probabilities)
+                    label = int(rng.choice(len(probabilities), p=probabilities))
+                    sampled.append(label)
+                    log_prob += float(np.log(max(float(probabilities[label]), 1e-12)))
+                labels = (sampled[0], sampled[1], sampled[2])
+            else:
+                # The deterministic runtime behavior is an argmax point mass.
+                # Its behavior probability is therefore exactly one; recording
+                # the softmax probability here would make PPO's old_log_prob
+                # describe a policy that did not select the action.
+                labels = tuple(int(logits.argmax()) for logits in logits_by_head)
+                log_prob = 0.0
+
+            buy_allowed = True
+            if observations is not None:
+                buy_allowed = self._buy_allowed(observations[slot])
+            state.intent = self._decision_to_intent(
+                output,
+                local_index,
+                labels,
+                buy_allowed=buy_allowed,
+            )
+            state.cached_intent = decision_output_to_intent_embedding_numpy(
+                output,
+                local_index,
+                labels=labels,
+            )
+            next_memory = output.get("next_decision_memory")
+            if next_memory is not None:
+                state.decision_memory = np.asarray(next_memory[local_index], dtype=np.float32).copy()
+            state.last_decision_tick = int(server_tick)
+            state.reflection_request_tick = None
+            decision_actions[slot] = labels
+            decision_log_probs[slot] = log_prob
+        self._last_decision_actions = tuple(decision_actions)
+        self._last_decision_log_probs = tuple(decision_log_probs)
+
+    def last_decision_behavior(
+        self,
+        count: int | None = None,
+    ) -> tuple[tuple[tuple[int, int, int] | None, ...], tuple[float | None, ...]]:
+        """Return the behavior decision recorded for the most recent tick."""
+
+        if count is None:
+            count = self.max_bots
+        if not 0 <= count <= self.max_bots:
+            raise ValueError("decision behavior count is outside runtime capacity")
+        return self._last_decision_actions[:count], self._last_decision_log_probs[:count]
+
+    def _run_action(self, observations: Sequence[BotObservationV1], server_tick: int) -> tuple[BotActionV1, ...]:
+        np = self._np
+        if not observations:
+            self._last_action_elapsed_ms = 0.0
+            return ()
+        local_observation = np.stack(
+            [np.frombuffer(observation.to_bytes(), dtype=np.uint8).astype(np.float32) / 255.0 for observation in observations]
+        )
+        cached_intent = np.stack([self._states[index].cached_intent for index in range(len(observations))])
+        action_hidden = np.stack([self._states[index].action_hidden for index in range(len(observations))])
+        feed = {
+            self._action_input_names[0]: local_observation,
+            self._action_input_names[1]: cached_intent,
+            self._action_input_names[2]: action_hidden,
+        }
+        started = time.perf_counter_ns()
+        values = self.action_session.run(None, feed)
+        completed = time.perf_counter_ns()
+        self._last_action_elapsed_ms = (completed - started) / 1_000_000.0
+        self._action_latency_ms.append(self._last_action_elapsed_ms)
+        output = dict(zip(self._action_output_names, values))
+        required = {
+            "action_vector",
+            "movement_alpha",
+            "movement_beta",
+            "mouse_loc",
+            "mouse_scale",
+            "mouse_mix_logits",
+            "button_logits",
+            "weapon_logits",
+            "buy_logits",
+            "next_action_hidden",
+        }
+        if not required.issubset(output):
+            raise ValueError("action session does not expose all action heads and next state")
+        actions: list[BotActionV1] = []
+        for index in range(len(observations)):
+            action = _action_from_onnx_outputs(
+                output["action_vector"][index],
+                output["button_logits"][index],
+                output["weapon_logits"][index],
+                output["buy_logits"][index],
+                server_tick=server_tick,
+                movement_alpha=output["movement_alpha"][index],
+                movement_beta=output["movement_beta"][index],
+                mouse_loc=output["mouse_loc"][index],
+                mouse_scale=output["mouse_scale"][index],
+                mouse_mix_logits=output["mouse_mix_logits"][index],
+                random_seed=server_tick * 1009 + index * 9176,
+                sample_distributions=self.stochastic_actions,
+            )
+            guarded = guard_action(
+                self._states[index].intent,
+                action,
+                observation=observations[index],
+            )
+            guarded = guard_friendly_fire(observations[index], guarded)
+            if guarded != action:
+                self._permission_violations += 1
+            self._states[index].action_hidden = np.asarray(
+                output["next_action_hidden"][index], dtype=np.float32
+            ).copy()
+            actions.append(guarded)
+        return tuple(actions)
+
+    @staticmethod
+    def _percentiles(values: Sequence[float]) -> dict[str, float]:
+        if not values:
+            return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+        import numpy as np
+
+        p50, p95, p99 = np.percentile(np.asarray(values, dtype=np.float64), [50, 95, 99])
+        return {"p50": float(p50), "p95": float(p95), "p99": float(p99)}
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "decision_ms": self._percentiles(self._decision_latency_ms),
+            "action_ms": self._percentiles(self._action_latency_ms),
+            "tick_ms": self._percentiles(self._tick_latency_ms),
+            "total_tick_deadline_miss": self._deadline_miss_count,
+            "permission_violations": self._permission_violations,
+        }
+
+    def process_tick(
+        self,
+        observations: Sequence[BotObservationV1],
+        *,
+        server_tick: int,
+        important_events: Sequence[Any] = (),
+    ) -> tuple[BotActionV1, ...]:
+        if server_tick < 0:
+            raise ValueError("server_tick must be non-negative")
+        if len(observations) > self.max_bots:
+            raise ValueError(f"runtime configured for at most {self.max_bots} bots")
+        observations = tuple(BotObservationV1(value.to_bytes()) for value in observations)
+        started = time.perf_counter_ns()
+        self._last_decision_actions = tuple(None for _ in range(self.max_bots))
+        self._last_decision_log_probs = tuple(None for _ in range(self.max_bots))
+        for slot, observation in enumerate(observations):
+            self._append_observation(self._states[slot], observation, self._np)
+        from .hierarchical_model import decision_refresh_due
+
+        due = [
+            slot
+            for slot in range(len(observations))
+            if decision_refresh_due(
+                server_tick,
+                self._states[slot].last_decision_tick,
+                self._states[slot].intent.ttl_ticks,
+                important_event=bool(important_events),
+                reflection_request_tick=self._states[slot].reflection_request_tick,
+            )
+        ]
+        self._run_decision(due, server_tick, observations)
+        actions = self._run_action(observations, server_tick)
+        completed = time.perf_counter_ns()
+        elapsed_ms = (completed - started) / 1_000_000.0
+        self._tick_latency_ms.append(elapsed_ms)
+        # Decision and action are synchronous on a tick.  A decision refresh
+        # therefore delays the action publication and must be included in the
+        # hard 128 Hz deadline measurement.
+        if elapsed_ms > self.tick_deadline_ms:
+            self._deadline_miss_count += 1
+        self._last_tick = server_tick
+        return actions
+
+
+class HierarchicalSharedMemoryRuntimeV1:
+    """接入 SourceMod 共享内存的双模型运行时适配层。
+
+    ``HierarchicalRuntimeService`` 只负责分层 ONNX 推理和每 Bot 状态；本类
+    负责 Protocol V1 批次、Get5 边界、动作发布以及进程级故障回退。这样旧的
+    单模型 ``RuntimeService`` 兼容路径可以继续服务 production 命令，而
+    test-only 分层模型不会被错误地塞进旧 actor 输入契约。
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: Any,
+        runtime: HierarchicalRuntimeService | None = None,
+        decision_session: Any | None = None,
+        action_session: Any | None = None,
+        decision_model_path: str | Path | None = None,
+        action_model_path: str | Path | None = None,
+        max_bots: int = MAX_BOTS,
+        tick_deadline_ms: float = 1000.0 / 128.0,
+        stochastic_decisions: bool = False,
+    ) -> None:
+        if runtime is not None and any(
+            value is not None
+            for value in (
+                decision_session,
+                action_session,
+                decision_model_path,
+                action_model_path,
+            )
+        ):
+            raise ValueError("provide runtime or hierarchical model/session inputs, not both")
+        if not 1 <= max_bots <= MAX_BOTS:
+            raise ValueError(f"max_bots must be between 1 and {MAX_BOTS}")
+        if runtime is None:
+            runtime = HierarchicalRuntimeService(
+                decision_session=decision_session,
+                action_session=action_session,
+                decision_model_path=decision_model_path,
+                action_model_path=action_model_path,
+                max_bots=max_bots,
+                tick_deadline_ms=tick_deadline_ms,
+                stochastic_decisions=stochastic_decisions,
+            )
+        if not isinstance(runtime, HierarchicalRuntimeService):
+            raise TypeError("runtime must be a HierarchicalRuntimeService")
+        if runtime.max_bots < max_bots:
+            raise ValueError("shared-memory max_bots cannot exceed hierarchical runtime capacity")
+        self.transport = transport
+        self.runtime = runtime
+        self.max_bots = int(max_bots)
+        self._round_epoch = int(transport.epoch)
+        self._write_sequence = 0
+        self._process_failed = False
+        self._failure_reason = ""
+        self._last_timing: dict[str, int] = {}
+        self._pending_events: list[Any] = []
+
+    @property
+    def process_failed(self) -> bool:
+        return self._process_failed
+
+    @property
+    def failure_reason(self) -> str:
+        return self._failure_reason
+
+    @property
+    def last_timing(self) -> dict[str, int]:
+        return dict(self._last_timing)
+
+    def metrics(self) -> dict[str, Any]:
+        metrics = dict(self.runtime.metrics())
+        metrics.update(
+            {
+                "process_failed": self.process_failed,
+                "failure_reason": self.failure_reason,
+            }
+        )
+        return metrics
+
+    def bot_state(self, slot: int) -> HierarchicalRuntimeStateV1:
+        return self.runtime.bot_state(slot)
+
+    def mark_process_failed(self, reason: str) -> None:
+        self._process_failed = True
+        self._failure_reason = str(reason)
+
+    def apply_boundaries(self, boundaries: Sequence[Any]) -> None:
+        """Apply Get5 control boundaries before the next observation tick."""
+
+        for boundary in boundaries:
+            self._pending_events.append(boundary)
+            kind = str(getattr(boundary, "kind", ""))
+            reset_hidden = bool(getattr(boundary, "reset_hidden", False))
+            terminal = bool(getattr(boundary, "terminal", False))
+            if kind in {"map_end", "series_end"} or terminal and kind in {
+                "map_end",
+                "series_end",
+            }:
+                self.runtime.end_match()
+            elif reset_hidden or kind in {
+                "round_end",
+                "halftime",
+                "overtime_start",
+                "backup_restore",
+            }:
+                self.runtime.reset_round()
+
+    def _sync_round_epoch(self) -> int:
+        current_epoch = int(self.transport.refresh_epoch())
+        if current_epoch != self._round_epoch:
+            self.runtime.reset_round()
+            self._round_epoch = current_epoch
+            self._write_sequence = 0
+            self._process_failed = False
+            self._failure_reason = ""
+        return current_epoch
+
+    def process_observation_batch(self, batch: ObservationBatchV1 | bytes) -> ActionBatchV1 | None:
+        if isinstance(batch, (bytes, bytearray, memoryview)):
+            batch = ObservationBatchV1.unpack(bytes(batch))
+        if not isinstance(batch, ObservationBatchV1):
+            raise TypeError("batch must be ObservationBatchV1 or bytes")
+        current_epoch = self._sync_round_epoch()
+        if batch.epoch != current_epoch:
+            # The bridge can leave one observation from the previous round in
+            # the ring while the native epoch has already advanced.  It is
+            # stale work, not an inference/runtime failure: the epoch sync
+            # above has already reset hidden state and action sequencing.
+            return None
+        if batch.bot_count > self.max_bots:
+            raise ValueError(f"runtime configured for at most {self.max_bots} bots")
+
+        observations = tuple(BotObservationV1(value) for value in batch.observations)
+        target_tick = int(batch.server_tick) + 1
+        inference_started_ns = time.perf_counter_ns()
+        actions: tuple[BotActionV1, ...]
+        pending_events = tuple(self._pending_events)
+        self._pending_events.clear()
+        if self._process_failed:
+            actions = tuple(valve_fallback_action(target_tick) for _ in observations)
+        else:
+            try:
+                actions = tuple(
+                    self.runtime.process_tick(
+                        observations,
+                        server_tick=int(batch.server_tick),
+                        important_events=pending_events,
+                    )
+                )
+                if len(actions) != batch.bot_count or any(
+                    not isinstance(action, BotActionV1) for action in actions
+                ):
+                    raise ValueError("hierarchical runtime returned an invalid action batch")
+            except Exception as error:
+                self.mark_process_failed(str(error))
+                actions = tuple(valve_fallback_action(target_tick) for _ in observations)
+        inference_completed_ns = time.perf_counter_ns()
+        result = ActionBatchV1(
+            epoch=batch.epoch,
+            server_tick=batch.server_tick,
+            actions=actions,
+            write_sequence=self._write_sequence,
+            decision_actions=(
+                tuple(None for _ in actions)
+                if self._process_failed
+                else self.runtime.last_decision_behavior(batch.bot_count)[0]
+            ),
+            decision_log_probs=(
+                tuple(None for _ in actions)
+                if self._process_failed
+                else self.runtime.last_decision_behavior(batch.bot_count)[1]
+            ),
+        )
+        self._write_sequence += 1
+        publish_started_ns = time.perf_counter_ns()
+        try:
+            self.transport.publish_action(result)
+        except ValueError as error:
+            # Get5 may advance the native IPC epoch between observation read and
+            # action publish (map/round/live boundary).  The computed action is
+            # stale for that epoch; discard it and reset state for the next
+            # observation instead of turning a normal boundary into a permanent
+            # inference fallback.
+            if "epoch" not in str(error).lower():
+                raise
+            self._sync_round_epoch()
+            return None
+        publish_completed_ns = time.perf_counter_ns()
+        self._last_timing = {
+            "inference_started_ns": inference_started_ns,
+            "inference_completed_ns": inference_completed_ns,
+            "publish_started_ns": publish_started_ns,
+            "publish_completed_ns": publish_completed_ns,
+        }
+        return result
+
+    def run(self, stop_event: threading.Event | None = None) -> None:
+        stop_event = stop_event or threading.Event()
+        while not stop_event.is_set():
+            try:
+                self._sync_round_epoch()
+                if not self.transport.wait_for_observation(100):
+                    continue
+                batch = self.transport.try_read_observation()
+                while batch is not None:
+                    candidate = self.transport.try_read_observation()
+                    if candidate is None:
+                        break
+                    batch = candidate
+            except QueueAborted:
+                return
+            except Exception as error:
+                self.mark_process_failed(str(error))
+                continue
+            if batch is not None:
+                try:
+                    self.process_observation_batch(batch)
+                except QueueAborted:
+                    # Shutdown may abort the native ring between the observation
+                    # read and action publish.  Treat that as an orderly worker
+                    # stop instead of leaking an exception from the runtime
+                    # thread into the launcher.
+                    return
+                except QueueFull as error:
+                    # Under an overloaded farm the bridge may not consume an
+                    # action slot before the next observation arrives.  Record
+                    # the overload for the capacity gate and keep the worker
+                    # alive so the next slot can recover instead of leaking a
+                    # thread exception.
+                    self.mark_process_failed(str(error))
+
+
+HierarchicalRuntimeV1 = HierarchicalRuntimeService
+
+
 class RuntimeService:
     """批量 CPU 推理与逐 Bot 缺帧/故障管理。"""
 
@@ -1197,6 +1951,11 @@ class RuntimeService:
                 if not self.transport.wait_for_observation(100):
                     continue
                 batch = self.transport.try_read_observation()
+                while batch is not None:
+                    candidate = self.transport.try_read_observation()
+                    if candidate is None:
+                        break
+                    batch = candidate
             except QueueAborted:
                 return
             except Exception as error:

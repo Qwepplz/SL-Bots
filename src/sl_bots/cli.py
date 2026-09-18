@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import threading
 import time
@@ -30,6 +31,9 @@ _COMMANDS: tuple[Command, ...] = (
     ("train", "selfplay"),
     ("train", "farm"),
     ("train", "pipeline"),
+    ("train", "test-pipeline"),
+    ("probe", "capacity"),
+    ("probe", "timescale"),
     ("export",),
     ("runtime", "serve"),
 )
@@ -38,6 +42,7 @@ _HUMAN_TARGET_NAMES = frozenset(
         "max_angular_velocity_deg_s",
         "max_angular_acceleration_deg_s2",
         "stop_go_ratio",
+        "fire_cadence_hz",
         "economy_choice_count",
         "utility_event_rate",
     }
@@ -132,7 +137,7 @@ def _add_leaf(
         parser.add_argument("--server-root", type=Path)
         parser.add_argument("--output-root", type=Path)
         parser.add_argument("--run-id")
-        parser.add_argument("--max-servers", type=int, default=4)
+        parser.add_argument("--max-servers", type=int, default=32)
         parser.add_argument("--dry-run", action="store_true")
     elif command == ("train", "pipeline"):
         parser.add_argument("--config", type=Path)
@@ -148,6 +153,26 @@ def _add_leaf(
             choices=[DataPurpose.PRODUCTION.value],
             default=DataPurpose.PRODUCTION.value,
         )
+    elif command == ("train", "test-pipeline"):
+        parser.add_argument("--config", type=Path, required=True)
+        parser.add_argument("--demo-root", type=Path, required=True)
+        parser.add_argument("--server-root", type=Path, required=True)
+        parser.add_argument(
+            "--purpose",
+            choices=[DataPurpose.TEST_ONLY.value],
+            default=DataPurpose.TEST_ONLY.value,
+        )
+    elif command == ("probe", "capacity"):
+        parser.add_argument("--max-instances", type=int, default=32)
+        parser.add_argument("--stable-window-seconds", type=float, default=20.0)
+        parser.add_argument("--report", type=Path)
+        parser.add_argument("--dry-run", action="store_true")
+    elif command == ("probe", "timescale"):
+        parser.add_argument("--candidates", default="1,2,4,8")
+        parser.add_argument("--stable-window-seconds", type=float, default=20.0)
+        parser.add_argument("--report", type=Path)
+        parser.add_argument("--instances", type=int, default=1)
+        parser.add_argument("--dry-run", action="store_true")
     elif command == ("export",):
         parser.add_argument("--checkpoint", type=Path)
         parser.add_argument("--manifest", type=Path)
@@ -186,6 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_leaf(train_sub, ("train", "selfplay"))
     _add_leaf(train_sub, ("train", "farm"))
     _add_leaf(train_sub, ("train", "pipeline"))
+    _add_leaf(train_sub, ("train", "test-pipeline"))
+
+    probe = top.add_parser("probe", help="测试服容量和 timescale 探测")
+    probe_sub = probe.add_subparsers(dest="operation", required=True)
+    _add_leaf(probe_sub, ("probe", "capacity"))
+    _add_leaf(probe_sub, ("probe", "timescale"))
 
     _add_leaf(top, ("export",))
 
@@ -706,12 +737,81 @@ def _run_farm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_probe(args: argparse.Namespace) -> int:
+    from .server_farm import (
+        CapacityProbeSampleV1,
+        ServerInstanceSpecV1,
+        TimescaleProbeSampleV1,
+        build_server_specs,
+        probe_capacity,
+        probe_timescale,
+    )
+
+    if not args.dry_run:
+        raise RuntimeError(
+            "live capacity/timescale probing must be launched by the test-training wrapper"
+        )
+    report_path = args.report or args.data_root / "probes" / f"{args.operation}.json"
+    if args.operation == "capacity":
+        sample = lambda count: CapacityProbeSampleV1(
+            requested_instances=count,
+            stable_window_s=args.stable_window_seconds,
+            process_alive=True,
+            rcon_ready=True,
+            map_progress=True,
+            cpu_percent=20.0,
+            ram_mb=1024.0 * count,
+            gpu_percent=50.0,
+            detail="dry-run does not measure live resource telemetry",
+        )
+        report = probe_capacity(
+            args.max_instances,
+            probe_runner=sample,
+            stable_window_s=args.stable_window_seconds,
+            report_path=report_path,
+        )
+    else:
+        candidates = tuple(int(value) for value in str(args.candidates).split(",") if value.strip())
+        specs = build_server_specs(
+            args.instances,
+            "probe-dry-run",
+            args.data_root / "server",
+            args.data_root / "probe-output",
+        )
+
+        def sample(timescale: int, selected: tuple[ServerInstanceSpecV1, ...]):
+            del selected
+            return TimescaleProbeSampleV1(
+                timescale=timescale,
+                supported=True,
+                readback_ok=True,
+                tick_speedup=float(timescale),
+                action_p99_ms=1.0,
+                deadline_misses=0,
+                detail="dry-run does not measure live resource telemetry",
+            )
+
+        report = probe_timescale(
+            specs,
+            candidates,
+            probe_runner=sample,
+            stable_window_s=args.stable_window_seconds,
+            report_path=report_path,
+        )
+    print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _start_pipeline_interrupt_listener() -> threading.Event:
     stop_event = threading.Event()
     if os.environ.get("SL_BOTS_CONTROL_STDIN") != "1":
         return stop_event
+    startup_complete = threading.Event()
 
     def listen() -> None:
+        # Do not let an already-buffered control line interrupt Thread.start()'s
+        # internal lock wait on Windows/Python 3.12.
+        startup_complete.wait()
         while not stop_event.is_set():
             line = sys.stdin.readline()
             if not line:
@@ -725,6 +825,7 @@ def _start_pipeline_interrupt_listener() -> threading.Event:
         name="sl-bots-stdin-control",
         daemon=True,
     ).start()
+    startup_complete.set()
     return stop_event
 
 
@@ -796,6 +897,145 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     return 0 if payload["phase"] == "completed" else 1
 
 
+def _validate_test_pipeline_preflight(
+    args: argparse.Namespace,
+    config: Any,
+) -> dict[str, Any]:
+    """Validate the test-only boundary before any server or training side effect."""
+
+    demo_root = Path(config.demo_root).resolve(strict=False)
+    data_root = Path(args.data_root).resolve(strict=False)
+    server_root = Path(config.server_root).resolve(strict=False)
+    if not demo_root.is_dir():
+        raise NotADirectoryError(f"Demo root does not exist: {demo_root}")
+    try:
+        data_root.relative_to(demo_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("data root must be outside the read-only Demo root")
+    data_root.mkdir(parents=True, exist_ok=True)
+    srcds = (server_root / "srcds.exe").resolve(strict=False)
+    if not srcds.is_file():
+        raise FileNotFoundError(f"absolute srcds.exe is required: {srcds}")
+    from .server_farm import build_server_specs
+
+    specs = build_server_specs(
+        int(config.max_server_probe),
+        "test-preflight",
+        server_root,
+        data_root,
+    )
+    if len({spec.rcon_port for spec in specs}) != len(specs):
+        raise ValueError("RCON ports are not unique")
+    free_bytes = shutil.disk_usage(data_root).free
+    minimum_free_bytes = 10 * 1024**3
+    if free_bytes < minimum_free_bytes:
+        raise RuntimeError("data volume does not have the required free disk space")
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("PyTorch is required for the GPU smoke preflight") from error
+    if not bool(torch.cuda.is_available()):
+        raise RuntimeError("GPU smoke preflight requires a CUDA/HIP device")
+    try:
+        import onnxruntime as ort
+    except ImportError as error:
+        raise RuntimeError("onnxruntime is required for the dual ONNX provider preflight") from error
+    providers = tuple(ort.get_available_providers())
+    if "CPUExecutionProvider" not in providers:
+        raise RuntimeError("onnxruntime must expose CPUExecutionProvider")
+    accelerator_providers = tuple(
+        provider for provider in providers if provider != "CPUExecutionProvider"
+    )
+    if not accelerator_providers:
+        raise RuntimeError("onnxruntime must expose an accelerator provider for test training")
+    return {
+        "demo_root": str(demo_root),
+        "data_root": str(data_root),
+        "server_root": str(server_root),
+        "srcds": str(srcds),
+        "rcon_ports": [spec.rcon_port for spec in specs],
+        "free_bytes": free_bytes,
+        "onnx_providers": list(providers),
+    }
+
+
+def _run_test_pipeline(args: argparse.Namespace) -> int:
+    from .test_pipeline import HierarchicalTestConfigV1, build_test_pipeline
+
+    config = HierarchicalTestConfigV1.from_yaml(
+        args.config,
+        demo_root=args.demo_root,
+        data_root=args.data_root,
+        server_root=args.server_root,
+    )
+    preflight = _validate_test_pipeline_preflight(args, config)
+    pipeline = build_test_pipeline(config, purpose=args.purpose)
+    interrupt_stop = _start_pipeline_interrupt_listener()
+    baseline = None
+    candidate = None
+    gate = None
+    pointers = None
+    try:
+        baseline = pipeline.run_demo_stage()
+        run_probe_stage = getattr(pipeline, "run_probe_stage", None)
+        if callable(run_probe_stage):
+            run_probe_stage(baseline)
+        candidate = pipeline.run_single_selfplay_wave(
+            baseline,
+            specs=getattr(pipeline, "selected_specs", ()),
+            host_timescale=int(getattr(pipeline, "selected_timescale", 1)),
+        )
+        if candidate is baseline or candidate is None:
+            if baseline is None:
+                raise RuntimeError("test pipeline aborted without a Demo-only baseline package")
+            # A failed wave is still a state transition: publish the known
+            # Demo-only package as active so a fresh data root never has an
+            # ambiguous or missing active pointer.
+            abort_gate = SimpleNamespace(
+                accepted=False,
+                reasons=("single self-play wave aborted before human gate",),
+                evidence={},
+            )
+            pointers = pipeline.select_pointers(baseline, baseline, abort_gate)
+            result = {
+                "status": "aborted",
+                "preflight": preflight,
+                "active": "demo-only",
+                "pointers": pointers,
+            }
+        else:
+            validation_manifest = getattr(pipeline, "validation_manifest", None)
+            if validation_manifest is None:
+                raise RuntimeError("test pipeline must expose validation_manifest before human gate")
+            gate = pipeline.run_human_gate(
+                baseline,
+                candidate,
+                validation_manifest,
+                pending_pointer=config.data_root / "models" / "pending.json",
+                active_pointer=config.data_root / "models" / "active.json",
+            )
+            pointers = pipeline.select_pointers(baseline, candidate, gate)
+            result = {
+                "status": "accepted-test-only" if gate.accepted else "rejected-test-only",
+                "preflight": preflight,
+                "gate": {
+                    "accepted": bool(gate.accepted),
+                    "reasons": list(gate.reasons),
+                    "evidence": dict(gate.evidence),
+                },
+                "pointers": pointers,
+            }
+    finally:
+        interrupt_stop.set()
+        finalize = getattr(pipeline, "finalize", None)
+        if callable(finalize):
+            finalize()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    return 0 if result["status"] == "accepted-test-only" else 1
+
+
 def _run_export(args: argparse.Namespace) -> int:
     from .export import export_actor
     from .training_bc import TrainingRunManifestV1
@@ -863,6 +1103,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_farm(args)
         if command == ("train", "pipeline"):
             return _run_pipeline(args)
+        if command == ("train", "test-pipeline"):
+            return _run_test_pipeline(args)
+        if command == ("probe", "capacity") or command == ("probe", "timescale"):
+            return _run_probe(args)
         if command == ("export",):
             return _run_export(args)
         if command == ("runtime", "serve"):

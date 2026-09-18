@@ -179,6 +179,7 @@ class Get5ControlState:
         event = event if isinstance(event, Get5ControlEventV1) else Get5ControlEventV1.unpack(event)
         if (
             self.expected_match_id_hash is not None
+            and int(event.match_id_hash) != 0
             and int(event.match_id_hash) != int(self.expected_match_id_hash)
         ):
             raise ProtocolError("control event match ID hash does not match the active match")

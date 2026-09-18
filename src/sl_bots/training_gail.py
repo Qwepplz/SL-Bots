@@ -20,6 +20,7 @@ _HUMAN_TARGET_NAMES = frozenset(
         "max_angular_velocity_deg_s",
         "max_angular_acceleration_deg_s2",
         "stop_go_ratio",
+        "fire_cadence_hz",
         "economy_choice_count",
         "utility_event_rate",
     }
@@ -924,6 +925,7 @@ class HumanLikeMetricsV1:
     max_angular_velocity_deg_s: float
     max_angular_acceleration_deg_s2: float
     stop_go_ratio: float
+    fire_cadence_hz: float
     space_occupancy: float
     engagement_distance: float
     utility_event_rate: float
@@ -949,11 +951,13 @@ class _HumanMetricsAccumulator:
         self._previous_yaw: float | None = None
         self._previous_velocity: float | None = None
         self._previous_movement: bool | None = None
+        self._previous_fire: bool | None = None
         self._max_velocity = 0.0
         self._max_acceleration = 0.0
         self._stop_go_changes = 0
         self._distance_sum = 0.0
         self._distance_count = 0
+        self._fire_events = 0
         self._utility_events = 0
         self._economy_choices = 0
         self._cells = bytearray(self._CELL_BITMAP_SIZE)
@@ -966,6 +970,7 @@ class _HumanMetricsAccumulator:
         self._previous_yaw = None
         self._previous_velocity = None
         self._previous_movement = None
+        self._previous_fire = None
 
     def _finish_episode(self) -> None:
         if self._first_time is not None and self._last_time is not None:
@@ -1037,6 +1042,10 @@ class _HumanMetricsAccumulator:
         if distance is not None:
             self._distance_sum += float(distance)
             self._distance_count += 1
+        fire = record.get("fire") not in (None, "", 0, False)
+        if fire and self._previous_fire is not True:
+            self._fire_events += 1
+        self._previous_fire = fire
         if record.get("utility") not in (None, "", 0, False):
             self._utility_events += 1
         if float(record.get("buy_action", 0)) > 0.0:
@@ -1054,6 +1063,7 @@ class _HumanMetricsAccumulator:
             max_angular_velocity_deg_s=self._max_velocity,
             max_angular_acceleration_deg_s2=self._max_acceleration,
             stop_go_ratio=self._stop_go_changes / max(1, self.count - 1),
+            fire_cadence_hz=self._fire_events / duration,
             space_occupancy=self._occupied_cells / max(1, self.count),
             engagement_distance=(
                 self._distance_sum / self._distance_count
@@ -1072,6 +1082,7 @@ class _HumanMetricQuantiles:
         "max_angular_velocity_deg_s",
         "max_angular_acceleration_deg_s2",
         "stop_go_ratio",
+        "fire_cadence_hz",
         "space_occupancy",
         "engagement_distance",
         "utility_event_rate",

@@ -4,11 +4,12 @@ import hashlib
 import json
 import os
 import subprocess
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .contracts import DataPurpose, ensure_purpose
+from .contracts import DataPurpose, HierarchicalPackageV2, ensure_purpose
 from .lineage import DatasetManifestV1, ProductionLineageError
 from .model import RecurrentStateV1, MirageActor
 
@@ -155,6 +156,20 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_safe(item) for item in value)
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _state_dict_sha256(state_dict: Mapping[str, Any]) -> str:
@@ -538,3 +553,161 @@ def export_actor(
     metadata_path = destination.with_suffix(".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
     return ExportManifestV1(destination, metadata_path, sha256, target, metadata)
+
+
+def export_hierarchical_package(
+    run_manifest: Any,
+    output_dir: str | Path,
+    purpose: DataPurpose | str,
+    *,
+    actor: Any,
+    generation: int = 0,
+    parent_generation: int | None = None,
+    metrics: Mapping[str, Any] | None = None,
+) -> HierarchicalPackageV2:
+    """Export and atomically describe the test-only decision/action pair."""
+
+    target = ensure_purpose(purpose)
+    if target is not DataPurpose.TEST_ONLY:
+        raise ProductionLineageError("hierarchical package export is test_only only")
+    if not hasattr(run_manifest, "assert_exportable"):
+        raise TypeError("run_manifest must expose assert_exportable")
+    run_manifest.assert_exportable(target)
+    if ensure_purpose(getattr(run_manifest, "purpose", target)) is not DataPurpose.TEST_ONLY:
+        raise ProductionLineageError("hierarchical package lineage must be test_only")
+    if not hasattr(actor, "decision") or not hasattr(actor, "action"):
+        raise TypeError("actor must expose decision and action branches")
+
+    from .quantization import (
+        contains_fake_quant,
+        export_action_fp32,
+        export_decision_int8,
+        prepare_action_fp32,
+        validate_action_fp32_graph,
+        validate_decision_int8_graph,
+    )
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    decision = copy.deepcopy(actor.decision).cpu()
+    action = copy.deepcopy(actor.action).cpu()
+    if not contains_fake_quant(decision):
+        raise ValueError(
+            "hierarchical package export requires a decision model trained with QAT; "
+            "export-time fake-quant preparation is not accepted"
+        )
+    run_metrics = getattr(run_manifest, "metrics", {})
+    export_metrics = metrics if isinstance(metrics, Mapping) else {}
+    qat_proven = isinstance(run_metrics, Mapping) and bool(
+        run_metrics.get("decision_qat_enabled", False)
+    )
+    qat_proven = qat_proven or bool(export_metrics.get("decision_qat_enabled", False))
+    checkpoint_path = Path(getattr(run_manifest, "checkpoint_path", ""))
+    if checkpoint_path.is_file():
+        try:
+            import torch
+        except ImportError as error:  # pragma: no cover - dependency boundary
+            raise RuntimeError("PyTorch is required to verify decision QAT provenance") from error
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, Mapping):
+            qat_state = checkpoint.get("qat_state", checkpoint.get("decision_qat_state"))
+            qat_proven = qat_proven or (
+                isinstance(qat_state, Mapping) and bool(qat_state.get("enabled", False))
+            )
+    if not qat_proven:
+        raise ValueError(
+            "hierarchical package export is missing decision QAT training provenance"
+        )
+    prepare_action_fp32(action)
+    decision_path = destination / "decision.int8.onnx"
+    action_path = destination / "action.fp32.onnx"
+    export_decision_int8(decision, decision_path)
+    export_action_fp32(action, action_path)
+    decision_report = validate_decision_int8_graph(decision_path)
+    action_report = validate_action_fp32_graph(action_path)
+    training_dataset = getattr(run_manifest, "dataset_manifest", None)
+    training_lineage = (
+        _manifest_to_dict(training_dataset)
+        if isinstance(training_dataset, DatasetManifestV1)
+        else {"purpose": DataPurpose.TEST_ONLY.value}
+    )
+    package_metrics = _json_safe({
+        "decision_graph": decision_report,
+        "action_graph": action_report,
+        **dict(metrics or {}),
+    })
+    package = HierarchicalPackageV2(
+        generation=generation,
+        parent_generation=parent_generation,
+        decision_path=decision_path,
+        action_path=action_path,
+        purpose=target,
+        decision_sha256=_sha256_file(decision_path),
+        action_sha256=_sha256_file(action_path),
+        state_schema={
+            "decision_memory": "float32[batch,32,512]",
+            "action_hidden": "float32[batch,384]",
+            "cached_intent": "float32[batch,128]",
+            "last_decision_tick": "int64[batch]",
+        },
+        decision_parameter_count=sum(parameter.numel() for parameter in decision.parameters()),
+        action_parameter_count=sum(parameter.numel() for parameter in action.parameters()),
+        metadata={
+            "purpose": target.value,
+            "training_lineage": training_lineage,
+            "training_run": {
+                "name": getattr(run_manifest, "name", ""),
+                "steps": getattr(run_manifest, "steps", None),
+                "config_sha256": getattr(run_manifest, "config_sha256", ""),
+                "checkpoint_path": str(getattr(run_manifest, "checkpoint_path", "")),
+            },
+            "decision_qat_proven": True,
+            "metrics": package_metrics,
+        },
+    )
+    package.assert_loadable()
+    (destination / "package-v2.json").write_text(
+        json.dumps(package.to_dict(), ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    (destination / "metrics.json").write_text(
+        json.dumps(package_metrics, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    return package
+
+
+def load_hierarchical_package(manifest_path: str | Path) -> HierarchicalPackageV2:
+    manifest = Path(manifest_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("hierarchical package manifest must be a JSON object")
+    payload = dict(payload)
+    for key in ("decision_path", "action_path"):
+        path = Path(payload[key])
+        if not path.is_absolute():
+            payload[key] = str((manifest.parent / path).resolve())
+    package = HierarchicalPackageV2.from_dict(payload)
+    package.assert_loadable()
+    return package
+
+
+def publish_hierarchical_package(
+    package: HierarchicalPackageV2,
+    pointer_path: str | Path,
+    *,
+    slot: str,
+) -> Path:
+    """Write an atomic active/pending pointer only after full package validation."""
+
+    if slot not in {"active", "pending"}:
+        raise ValueError("package pointer slot must be active or pending")
+    package.assert_loadable()
+    pointer = Path(pointer_path)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    temporary = pointer.with_suffix(pointer.suffix + ".tmp")
+    payload = package.to_dict()
+    payload["pointer_slot"] = slot
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    os.replace(temporary, pointer)
+    return pointer

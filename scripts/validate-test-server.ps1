@@ -4,16 +4,22 @@ param(
     [string]$ServerRoot,
     [string]$BridgePlugin = "",
     [string]$IpcExtension = "",
-    [ValidateRange(1, 4)]
+    [ValidateRange(1, 32)]
     [int]$InstanceCount = 1,
+    [ValidateRange(1024, 65503)]
+    [int]$RconPortBase = 27100,
     [string]$RunId = "",
-    [switch]$RequireRunning
+    [switch]$RequireRunning,
+    [switch]$RequireRcon
 )
 
 $ErrorActionPreference = "Stop"
 $root = [IO.Path]::GetFullPath($ServerRoot)
 if (-not (Test-Path -LiteralPath $root -PathType Container)) {
     throw "测试服目录不存在：$root"
+}
+if (($RconPortBase + $InstanceCount) -gt 65535) {
+    throw "RCON 端口范围超出 TCP 端口上限"
 }
 
 $srcds = Join-Path $root "srcds.exe"
@@ -49,12 +55,20 @@ $ports = @()
 if (-not [string]::IsNullOrWhiteSpace($RunId)) {
     for ($index = 1; $index -le $InstanceCount; $index++) {
         $instanceId = "{0:D2}" -f $index
-        $instancePorts = @(27100 + $index, 27200 + $index, 27300 + $index, 27400 + $index)
+        $instancePorts = @(
+            [int](27100 + $index)
+            [int](27200 + $index)
+            [int](27300 + $index)
+            [int](27400 + $index)
+        )
+        $rconPort = [int]$RconPortBase + [int]$index
         $ports += $instancePorts
+        # Source 1 CS:GO exposes RCON on the same TCP endpoint as -port.
         $configPath = Join-Path $gameDir "cfg\get5\slbots\$RunId\instance-$instanceId.json"
         $instances += [pscustomobject]@{
             instance_id = $instanceId
             ports = $instancePorts
+            rcon_port = $rconPort
             ipc_name = "SLBots_de_mirage_$instanceId"
             get5_config_path = [IO.Path]::GetFullPath($configPath)
             get5_config_present = Test-Path -LiteralPath $configPath -PathType Leaf
@@ -68,6 +82,18 @@ if (-not [string]::IsNullOrWhiteSpace($RunId)) {
 $processes = @(Get-Process -Name "srcds" -ErrorAction SilentlyContinue)
 if ($RequireRunning -and $processes.Count -eq 0) {
     throw "要求测试服运行，但未发现 srcds.exe 进程"
+}
+
+$rconReady = $null
+if ($RequireRcon) {
+    $rconReady = @()
+    foreach ($instance in $instances) {
+        $probe = Test-NetConnection -ComputerName "127.0.0.1" -Port $instance.rcon_port -InformationLevel Quiet -WarningAction SilentlyContinue
+        $rconReady += [bool]$probe
+    }
+    if ($rconReady -contains $false) {
+        throw "至少一个测试服 RCON 端口无响应"
+    }
 }
 
 $requiredFiles = @($srcds, $gameDir, $sourcemod, $get5)
@@ -90,6 +116,9 @@ $hashes = foreach ($file in $requiredFiles) {
     server_root = $root
     tickrate_required = 128
     map_required = "de_mirage"
+    rcon_port_base = $RconPortBase
+    rcon_required = [bool]$RequireRcon
+    rcon_ready = $rconReady
     get5_present = $true
     srcds_running = $processes.Count -gt 0
     instances = @($instances)

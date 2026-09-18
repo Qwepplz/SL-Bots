@@ -29,6 +29,7 @@ IN_BACK = 1 << 4
 IN_USE = 1 << 5
 IN_ATTACK2 = 1 << 11
 IN_RELOAD = 1 << 13
+IN_SPEED = 1 << 17
 IN_MOVELEFT = 1 << 9
 IN_MOVERIGHT = 1 << 10
 
@@ -118,7 +119,7 @@ def _button_label(player: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
     evidence = False
     state_bits = (
         ("is_ducking", IN_DUCK),
-        ("is_walking", 0),
+        ("is_walking", IN_SPEED),
     )
     for name, bit in state_bits:
         if name in player:

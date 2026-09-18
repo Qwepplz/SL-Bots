@@ -20,11 +20,16 @@ native int Get5_GetMapNumber();
 #define SLBOTS_PLAYER_ALIVE (1 << 3)
 #define SLBOTS_PLAYER_KNOWN (1 << 4)
 #define SLBOTS_PLAYER_PERIPHERAL (1 << 5)
+#define SLBOTS_MAX_INSTANCE_ID 32
+// Actions are applied only within a two-tick publication window.  A packet
+// that falls farther behind is stale and must not drive a UserCmd.
+#define SLBOTS_MAX_ACTION_AGE_TICKS 2
 
 int g_Epoch = 1;
 int g_ControlSequence;
 int g_ControlPolicyGeneration;
 ConVar g_ControlPolicyGenerationCvar;
+int g_LastRulesDiagnosticTick = -1000000;
 int g_RoundNumber;
 bool g_ControlPaused;
 bool g_RulesValid = true;
@@ -53,6 +58,7 @@ int g_MissingConsecutive[SLBOTS_MAX_BOTS];
 bool g_MissingWindow[SLBOTS_MAX_BOTS][SLBOTS_MISSING_WINDOW_SIZE];
 int g_MissingWindowIndex[SLBOTS_MAX_BOTS];
 int g_MissingWindowCount[SLBOTS_MAX_BOTS];
+int g_MissingWindowEntries[SLBOTS_MAX_BOTS];
 int g_LastMissingTick[SLBOTS_MAX_BOTS];
 int g_LastKnownTick[MAXPLAYERS + 1][MAXPLAYERS + 1];
 float g_LastKnownPosition[MAXPLAYERS + 1][MAXPLAYERS + 1][3];
@@ -73,6 +79,8 @@ char g_IpcName[128];
 bool g_Get5Available;
 bool g_Get5MatchIdAvailable;
 bool g_Get5MapNumberAvailable;
+ConVar g_Get5GameStateCvar;
+bool g_PlayerFlashedAvailable;
 bool g_Open;
 
 public Plugin myinfo = {
@@ -103,7 +111,10 @@ public void OnPluginStart() {
     HookEvent("weapon_reload", Event_Observation, EventHookMode_Post);
     HookEvent("player_hurt", Event_Observation, EventHookMode_Post);
     HookEvent("player_death", Event_Observation, EventHookMode_Post);
-    HookEvent("player_flashed", Event_Observation, EventHookMode_Post);
+    g_PlayerFlashedAvailable = HookEventEx("player_flashed", Event_Observation, EventHookMode_Post);
+    if (!g_PlayerFlashedAvailable) {
+        LogMessage("optional player_flashed event is unavailable; flash observation is degraded");
+    }
     HookEvent("grenade_thrown", Event_Observation, EventHookMode_Post);
     HookEvent("smokegrenade_detonate", Event_Observation, EventHookMode_Post);
     HookEvent("flashbang_detonate", Event_Observation, EventHookMode_Post);
@@ -112,16 +123,17 @@ public void OnPluginStart() {
     HookEvent("decoy_started", Event_Observation, EventHookMode_Post);
     HookEvent("player_footstep", Event_Observation, EventHookMode_Post);
     HookEvent("player_jump", Event_Observation, EventHookMode_Post);
-    HookEvent("get5_going_live", Event_Get5GoingLive, EventHookMode_PostNoCopy);
-    HookEvent("get5_live", Event_Get5Live, EventHookMode_PostNoCopy);
-    HookEvent("get5_pause", Event_Get5Pause, EventHookMode_PostNoCopy);
-    HookEvent("get5_resume", Event_Get5Resume, EventHookMode_PostNoCopy);
-    HookEvent("get5_backup_restore", Event_Get5BackupRestore, EventHookMode_PostNoCopy);
-    HookEvent("get5_map_end", Event_Get5MapEnd, EventHookMode_PostNoCopy);
-    HookEvent("get5_series_end", Event_Get5SeriesEnd, EventHookMode_PostNoCopy);
+    HookEventEx("get5_going_live", Event_Get5GoingLive, EventHookMode_PostNoCopy);
+    HookEventEx("get5_live", Event_Get5Live, EventHookMode_PostNoCopy);
+    HookEventEx("get5_pause", Event_Get5Pause, EventHookMode_PostNoCopy);
+    HookEventEx("get5_resume", Event_Get5Resume, EventHookMode_PostNoCopy);
+    HookEventEx("get5_backup_restore", Event_Get5BackupRestore, EventHookMode_PostNoCopy);
+    HookEventEx("get5_map_end", Event_Get5MapEnd, EventHookMode_PostNoCopy);
+    HookEventEx("get5_series_end", Event_Get5SeriesEnd, EventHookMode_PostNoCopy);
     g_Get5Available = GetFeatureStatus(FeatureType_Native, "Get5_GetGameState") == FeatureStatus_Available;
     g_Get5MatchIdAvailable = GetFeatureStatus(FeatureType_Native, "Get5_GetMatchID") == FeatureStatus_Available;
     g_Get5MapNumberAvailable = GetFeatureStatus(FeatureType_Native, "Get5_GetMapNumber") == FeatureStatus_Available;
+    g_Get5GameStateCvar = FindConVar("get5_game_state");
     g_RulesValid = true;
     g_ControlPaused = false;
     ResetRuntimeState();
@@ -186,16 +198,16 @@ void OpenTransport() {
     if (instanceCvar != null) {
         GetConVarString(instanceCvar, instanceId, sizeof(instanceId));
     }
+    int numericInstanceId = StringToInt(instanceId);
     if (instanceId[0] != '\0' &&
-        (strcmp(instanceId, "01") != 0 && strcmp(instanceId, "02") != 0 &&
-         strcmp(instanceId, "03") != 0 && strcmp(instanceId, "04") != 0)) {
+        (strlen(instanceId) != 2 || numericInstanceId < 1 || numericInstanceId > SLBOTS_MAX_INSTANCE_ID)) {
         LogError("invalid sl_bots_instance_id: %s", instanceId);
         instanceId[0] = '\0';
     }
     if (instanceId[0] == '\0') {
         FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s", mapName);
     } else {
-        FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s_%s", mapName, instanceId);
+        FormatEx(g_IpcName, sizeof(g_IpcName), "SLBots_%s_%02d", mapName, numericInstanceId);
     }
     if (g_Open) {
         SLBots_Close();
@@ -256,8 +268,11 @@ public void Event_Get5GoingLive(Event event, const char[] name, bool dontBroadca
 }
 
 public void Event_Get5Live(Event event, const char[] name, bool dontBroadcast) {
+    g_RulesValid = ValidateMR12Rules();
     if (g_RulesValid) {
         PublishControlEvent(SLBOTS_CONTROL_LIVE, GetGameTickCount(), g_RoundNumber);
+    } else {
+        PublishControlEvent(SLBOTS_CONTROL_FALLBACK, GetGameTickCount(), g_RoundNumber);
     }
 }
 
@@ -301,7 +316,19 @@ bool ValidateMR12Rules() {
 
 bool ValidateCvar(const char[] name, int expected) {
     ConVar cvar = FindConVar(name);
-    return cvar != null && GetConVarInt(cvar) == expected;
+    if (cvar == null) {
+        return false;
+    }
+    int actual = GetConVarInt(cvar);
+    if (actual != expected) {
+        int currentTick = GetGameTickCount();
+        if (currentTick - g_LastRulesDiagnosticTick >= 128) {
+            LogError("MR12 cvar mismatch: %s expected %d actual %d", name, expected, actual);
+            g_LastRulesDiagnosticTick = currentTick;
+        }
+        return false;
+    }
+    return true;
 }
 
 void ResetRuntimeState() {
@@ -323,6 +350,7 @@ void ResetRuntimeState() {
         g_MissingConsecutive[slot] = 0;
         g_MissingWindowIndex[slot] = 0;
         g_MissingWindowCount[slot] = 0;
+        g_MissingWindowEntries[slot] = 0;
         g_LastMissingTick[slot] = -1;
         for (int index = 0; index < SLBOTS_MISSING_WINDOW_SIZE; index++) {
             g_MissingWindow[slot][index] = false;
@@ -419,9 +447,13 @@ public Action OnPlayerRunCmd(
     if (g_BotPermanentFallback[slot]) {
         return Plugin_Continue;
     }
+    // Fake clients report tickcount=0 in OnPlayerRunCmd.  The missing-action
+    // window must advance on the server tick or a silent worker can be
+    // deduplicated forever at tick 0.
+    int commandTick = GetGameTickCount();
     int actionSlot = FindActionSlot(client);
     if (actionSlot < 0) {
-        RecordMissing(slot, tickcount);
+        RecordMissing(slot, commandTick);
         if (g_BotPermanentFallback[slot]) {
             return Plugin_Continue;
         }
@@ -430,8 +462,13 @@ public Action OnPlayerRunCmd(
     }
     int actionOffset = 9 + actionSlot * 9;
     int targetTick = g_LastActionPacket[actionOffset];
-    if (g_LastActionTick < 0 || targetTick != tickcount) {
-        RecordMissing(slot, tickcount);
+    // In the real server OnPlayerRunCmd can run before the Python worker's
+    // action for this observation is published.  Keep the latest action for
+    // a short bounded window instead of converting every one-tick late action
+    // into a neutral command.  A genuinely stale worker still falls back.
+    if (g_LastActionTick < 0 || targetTick > commandTick ||
+        commandTick - targetTick > SLBOTS_MAX_ACTION_AGE_TICKS) {
+        RecordMissing(slot, commandTick);
         if (g_BotPermanentFallback[slot]) {
             return Plugin_Continue;
         }
@@ -443,7 +480,7 @@ public Action OnPlayerRunCmd(
         SetPermanentFallback(slot);
         return Plugin_Continue;
     }
-    RecordValid(slot, tickcount);
+    RecordValid(slot, commandTick);
     float currentAngles[3];
     GetClientEyeAngles(client, currentAngles);
     angles[0] = currentAngles[0];
@@ -495,23 +532,39 @@ public Action OnPlayerRunCmd(
     if (validMask & SLBOTS_ACTION_MASK_BUY) {
         ExecuteBuyAction(client, slot, Signed16(g_LastActionPacket[actionOffset + 7] >> 16));
     }
-    RecordActionApplied(tickcount);
+    RecordActionApplied(commandTick);
     return Plugin_Changed;
 }
 
 int GetActivePhase() {
-    if (!g_Get5Available || !g_RulesValid || g_ControlPaused) {
+    if (g_ControlPaused) {
         return -1;
     }
-    int state = Get5_GetGameState();
+    if (g_Get5GameStateCvar == null) {
+        g_Get5GameStateCvar = FindConVar("get5_game_state");
+    }
+    if (!g_Get5Available && g_Get5GameStateCvar == null) {
+        return -1;
+    }
+    int state = g_Get5Available ? Get5_GetGameState() : -1;
+    if (g_Get5GameStateCvar != null) {
+        state = GetConVarInt(g_Get5GameStateCvar);
+    }
+    if (state == SLBOTS_GET5_LIVE) {
+        // Get5 can emit going_live while its asynchronous live.cfg replay is
+        // still settling. Revalidate on the live state so a transient warmup
+        // cvar mismatch does not permanently suppress live observations.
+        g_RulesValid = ValidateMR12Rules();
+        return g_RulesValid ? 2 : -1;
+    }
+    if (!g_RulesValid) {
+        return -1;
+    }
     if (state == SLBOTS_GET5_WARMUP) {
         return 0;
     }
     if (state == SLBOTS_GET5_KNIFE) {
         return 1;
-    }
-    if (state == SLBOTS_GET5_LIVE) {
-        return 2;
     }
     return -1;
 }
@@ -1238,6 +1291,7 @@ void SynchronizeBotSlots(int count) {
         g_MissingConsecutive[slot] = 0;
         g_MissingWindowIndex[slot] = 0;
         g_MissingWindowCount[slot] = 0;
+        g_MissingWindowEntries[slot] = 0;
         g_LastMissingTick[slot] = -1;
         g_LastBuyAction[slot] = 0;
         for (int index = 0; index < SLBOTS_MISSING_WINDOW_SIZE; index++) {
@@ -1271,12 +1325,15 @@ void RecordMissing(int slot, int tick) {
     g_LastMissingTick[slot] = tick;
     g_MissingConsecutive[slot]++;
     int index = g_MissingWindowIndex[slot];
-    if (g_MissingWindowCount[slot] < SLBOTS_MISSING_WINDOW_SIZE) {
-        g_MissingWindowCount[slot]++;
-    } else if (g_MissingWindow[slot][index]) {
+    bool full = g_MissingWindowEntries[slot] >= SLBOTS_MISSING_WINDOW_SIZE;
+    if (full && g_MissingWindow[slot][index]) {
         g_MissingWindowCount[slot]--;
     }
+    if (!full) {
+        g_MissingWindowEntries[slot]++;
+    }
     g_MissingWindow[slot][index] = true;
+    g_MissingWindowCount[slot]++;
     g_MissingWindowIndex[slot] = (index + 1) % SLBOTS_MISSING_WINDOW_SIZE;
     if (g_MissingConsecutive[slot] >= 32 || g_MissingWindowCount[slot] >= 32) {
         SetPermanentFallback(slot);
@@ -1290,8 +1347,12 @@ void RecordValid(int slot, int tick) {
     g_LastMissingTick[slot] = tick;
     g_MissingConsecutive[slot] = 0;
     int index = g_MissingWindowIndex[slot];
-    if (g_MissingWindowCount[slot] == SLBOTS_MISSING_WINDOW_SIZE && g_MissingWindow[slot][index]) {
+    bool full = g_MissingWindowEntries[slot] >= SLBOTS_MISSING_WINDOW_SIZE;
+    if (full && g_MissingWindow[slot][index]) {
         g_MissingWindowCount[slot]--;
+    }
+    if (!full) {
+        g_MissingWindowEntries[slot]++;
     }
     g_MissingWindow[slot][index] = false;
     g_MissingWindowIndex[slot] = (index + 1) % SLBOTS_MISSING_WINDOW_SIZE;
@@ -1369,7 +1430,8 @@ void PollActionPacket() {
         g_LastActionPacket[index] = packet[index];
     }
     for (int index = 0; index < SLBOTS_MAX_BOTS; index++) {
-        g_LastActionClients[index] = index < packetBotCount ? g_ObservationSnapshotClients[snapshot][index] : 0;
+        int client = index < packetBotCount ? g_ObservationSnapshotClients[snapshot][index] : 0;
+        g_LastActionClients[index] = client;
     }
     g_LastActionTick = packetTick + 1;
     g_LastActionAckTick = -1;

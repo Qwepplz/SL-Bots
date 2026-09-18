@@ -119,3 +119,18 @@ class RewardLedger:
 
     def reset(self) -> None:
         self._previous.clear()
+
+
+def human_metric_regression_fraction(
+    baseline: Mapping[str, float],
+    candidate: Mapping[str, float],
+) -> dict[str, float]:
+    """Return absolute per-metric change used by the human-like gate."""
+
+    result: dict[str, float] = {}
+    for name in sorted(set(baseline) & set(candidate)):
+        reference = float(baseline[name])
+        value = float(candidate[name])
+        denominator = max(abs(reference), 1e-9)
+        result[name] = abs(value - reference) / denominator
+    return result
