@@ -163,7 +163,8 @@ def _local_movement(tick_player: Mapping[str, Any], next_player: Mapping[str, An
     except (TypeError, ValueError):
         yaw = 0.0
     forward_speed = velocity[0] * math.cos(yaw) + velocity[1] * math.sin(yaw)
-    side_speed = -velocity[0] * math.sin(yaw) + velocity[1] * math.cos(yaw)
+    # Source UserCmd positive side points right (negative world Y at yaw zero).
+    side_speed = velocity[0] * math.sin(yaw) - velocity[1] * math.cos(yaw)
     forward = _clamp(forward_speed / 250.0, -1.0, 1.0)
     side = _clamp(side_speed / 250.0, -1.0, 1.0)
     up = _clamp(velocity[2] / 250.0, -1.0, 1.0)

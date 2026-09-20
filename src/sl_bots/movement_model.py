@@ -102,16 +102,33 @@ class LegalEntityMovementTransformer(nn.Module):
         self.jump_head = nn.Linear(token_width, horizons * JUMP_CLASS_COUNT)
 
     def _project_tokens(self, features: Tensor, token_type: Tensor) -> Tensor:
-        projected = torch.zeros(
-            features.shape[0], features.shape[1], self.token_width,
-            dtype=features.dtype,
-            device=features.device,
-        )
-        for token_kind, projection in enumerate(self.type_projections):
-            candidate = projection(features)
-            mask = (token_type == token_kind).view(1, -1, 1)
-            projected = torch.where(mask, candidate, projected)
-        return projected
+        # legal_entity_tokens has a fixed layout; each MLP owns one slice.
+        boundaries = (0, 1, 10, 26, 42, 43, TOKEN_COUNT)
+        return torch.cat([
+            projection(features[:, boundaries[kind]:boundaries[kind + 1]])
+            for kind, projection in enumerate(self.type_projections)
+        ], dim=1)
+
+    def _encode_for_onnx(self, hidden: Tensor, valid_mask: Tensor) -> Tensor:
+        """Expand single-head attention, retaining only batch-visible tokens."""
+        # Masked keys cannot influence valid queries in any layer. Keep the
+        # union across actors and retain their individual attention masks.
+        keep = torch.nonzero(valid_mask.any(dim=0), as_tuple=False).flatten()
+        hidden = hidden.index_select(1, keep)
+        valid_mask = valid_mask.index_select(1, keep)
+        padding_mask = ~valid_mask.unsqueeze(1)
+        for layer in self.encoder.layers:
+            attention = layer.self_attn
+            query, key, value = F.linear(
+                hidden, attention.in_proj_weight, attention.in_proj_bias,
+            ).chunk(3, dim=-1)
+            scores = torch.matmul(query, key.transpose(-2, -1)) * (self.token_width ** -0.5)
+            probabilities = torch.softmax(scores.masked_fill(padding_mask, float("-inf")), dim=-1)
+            attended = attention.out_proj(torch.matmul(probabilities, value))
+            hidden = layer.norm1(hidden + attended)
+            feedforward = layer.linear2(layer.activation(layer.linear1(hidden)))
+            hidden = layer.norm2(hidden + feedforward)
+        return hidden
 
     def forward(self, observation: Tensor) -> MovementOutputV1:
         _check_observation(observation)
@@ -119,7 +136,10 @@ class LegalEntityMovementTransformer(nn.Module):
         hidden = self._project_tokens(tokens.features, tokens.token_type)
         hidden = hidden + self.token_type_embedding(tokens.token_type).unsqueeze(0)
         hidden = hidden + self.slot_embedding.weight.unsqueeze(0)
-        encoded = self.encoder(hidden, src_key_padding_mask=~tokens.valid_mask)
+        if torch.onnx.is_in_onnx_export():
+            encoded = self._encode_for_onnx(hidden, tokens.valid_mask)
+        else:
+            encoded = self.encoder(hidden, src_key_padding_mask=~tokens.valid_mask)
         self_hidden = self.output_norm(encoded[:, 0])
         move_logits = self.move_head(self_hidden).reshape(-1, self.horizons, MOVEMENT_CLASS_COUNT)
         stance_logits = self.stance_head(self_hidden).reshape(-1, self.horizons, STANCE_CLASS_COUNT)
@@ -143,6 +163,48 @@ class LegalEntityMovementTransformer(nn.Module):
         return MovementOutputV1(move_logits, stance_logits, jump_logits, plan_embedding)
 
 
+def visible_enemy_combat_features(observation: Tensor) -> tuple[Tensor, Tensor]:
+    """Slot-independent combat inputs, restricted to directly visible live enemies."""
+    raw = (observation.float().clamp(0.0, 1.0) * 255.0).round()
+    slots = raw[:, 44:152].reshape(-1, 9, 12)
+
+    def bit(value: Tensor, divisor: float) -> Tensor:
+        return torch.remainder(torch.floor(value / divisor), 2.0) > 0.5
+
+    def signed(value: Tensor, boundary: float) -> Tensor:
+        return torch.where(value >= boundary, value - 2.0 * boundary, value)
+
+    flags = slots[:, :, 3]
+    valid = (slots[:, :, 2] == 255.0) & bit(flags, 1.0) & bit(flags, 8.0)
+    bearing = signed(slots[:, :, 4] + 256.0 * slots[:, :, 5], 32768.0) / 100.0
+    pitch = signed(slots[:, :, 6], 128.0)
+    distance = slots[:, :, 7] + 256.0 * slots[:, :, 8]
+    # Resolve ties by entity identity, then geometry for missing/duplicate IDs.
+    # Separate reductions retain exact integer keys without FP32 packed-key collisions.
+    entity_id = slots[:, :, 0] + 256.0 * slots[:, :, 1]
+    candidates = valid
+    for key in (bearing.abs(), entity_id, distance, pitch, bearing):
+        best = torch.where(candidates, key, torch.full_like(key, 1e9)).min(dim=1, keepdim=True).values
+        candidates = candidates & (key == best)
+    choice = candidates.to(raw.dtype).argmax(dim=1, keepdim=True)
+    visible = valid.any(dim=1)
+    mask = visible.to(raw.dtype)
+    b = bearing.gather(1, choice).squeeze(1) * mask
+    p = pitch.gather(1, choice).squeeze(1) * mask
+    d = distance.gather(1, choice).squeeze(1) * mask
+    self_pitch = signed(raw[:, 22] + 256.0 * raw[:, 23], 32768.0) / 900.0
+    velocity = signed(raw[:, 24:26], 128.0) * (16.0 / 250.0)
+    speed = velocity.square().sum(dim=1).sqrt()
+    self_flags = raw[:, 26]
+    features = torch.stack((
+        b / 30.0, p / 30.0, d / 1000.0, mask / (1.0 + d / 100.0), mask,
+        self_pitch, speed, bit(self_flags, 2.0).to(raw.dtype),
+        bit(self_flags, 8.0).to(raw.dtype), raw[:, 10] / 100.0,
+        raw[:, 36] / 255.0, raw[:, 37] / 255.0,
+    ), dim=1)
+    return features, visible
+
+
 class ReactiveActionPolicyV3(nn.Module):
     """FP32 128 Hz reaction policy conditioned on a predicted movement plan."""
 
@@ -153,6 +215,7 @@ class ReactiveActionPolicyV3(nn.Module):
         hidden_size: int = ACTION_HIDDEN_SIZE_V3,
         weapon_count: int = 16,
         buy_count: int = 32,
+        combat_head: bool = False,
     ) -> None:
         super().__init__()
         if plan_size != MOVEMENT_PLAN_SIZE or hidden_size != ACTION_HIDDEN_SIZE_V3:
@@ -175,6 +238,10 @@ class ReactiveActionPolicyV3(nn.Module):
         self.button_head = nn.Linear(hidden_size, 32)
         self.weapon_head = nn.Linear(hidden_size, weapon_count)
         self.buy_head = nn.Linear(hidden_size, buy_count)
+        self.combat_head = (
+            nn.Sequential(nn.Linear(12, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 3))
+            if combat_head else None
+        )
 
     def forward(self, local_observation: Tensor, movement_plan: Tensor, hidden: Tensor) -> ReactiveActionOutputV3:
         _check_observation(local_observation)
@@ -185,11 +252,23 @@ class ReactiveActionPolicyV3(nn.Module):
         local = self.local_encoder(canonical_observation_features(local_observation))
         plan_condition = self.plan_encoder(movement_plan)
         next_hidden = self.action_gru(torch.cat((local, plan_condition), dim=-1), hidden)
+        mouse_loc = self.mouse_loc_head(next_hidden)
+        button_logits = self.button_head(next_hidden)
+        if self.combat_head is not None:
+            combat_features, visible = visible_enemy_combat_features(local_observation)
+            combat = self.combat_head(combat_features)
+            mouse_loc = torch.where(visible.unsqueeze(1), combat[:, :2], mouse_loc)
+            raw = (local_observation * 255.0).round()
+            weapon = raw[:, 41]
+            planting = torch.remainder(torch.floor(raw[:, 26] / 128.0), 2.0) != 0
+            firearm = (weapon >= 0) & (weapon <= 9)
+            attack = torch.where(firearm & ~planting, combat[:, 2], button_logits[:, 0])
+            button_logits = torch.cat((attack.unsqueeze(1), button_logits[:, 1:]), dim=-1)
         return ReactiveActionOutputV3(
-            mouse_loc=self.mouse_loc_head(next_hidden),
+            mouse_loc=mouse_loc,
             mouse_scale=F.softplus(self.mouse_scale_head(next_hidden)) + 1e-3,
             mouse_mix_logits=self.mouse_mix_head(next_hidden).reshape(-1, 2, 3),
-            button_logits=self.button_head(next_hidden),
+            button_logits=button_logits,
             weapon_logits=self.weapon_head(next_hidden),
             buy_logits=self.buy_head(next_hidden),
             next_hidden=next_hidden,

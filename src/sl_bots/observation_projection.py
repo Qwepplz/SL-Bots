@@ -99,6 +99,7 @@ _WEAPON_IDS = {
     "HE Grenade": 11,
     "Flashbang": 12,
     "Smoke Grenade": 13,
+    "C4": 14,
 }
 _WEAPON_NAMES = {value: key for key, value in _WEAPON_IDS.items()}
 
@@ -760,6 +761,9 @@ def project_observation(
     memory._last_time[observer_key] = now
     _update_smokes(memory, events, now)
     observer_position = _as_vector(observer.get("position")) or (0.0, 0.0, 0.0)
+    # Demo snapshots record the same eye origin used by GetClientEyePosition.
+    observer_eye_position = _as_vector(observer.get("position_eyes")) or observer_position
+    observer_pitch = float(observer.get("view_pitch_deg", 0.0))
     current_sounds: list[ProjectedSound] = []
     audible_sources: dict[
         str, tuple[float, float, float, bool, bool, float, tuple[float, float, float] | None]
@@ -865,7 +869,13 @@ def project_observation(
                 continue
             projected_players.append(ProjectedPlayer(entity_id=0, relation=relation, flags=flags))
             continue
-        bearing, elevation, distance = _geometry(observer_position, target_position)
+        bearing, elevation, distance = _geometry(observer_eye_position, target_position)
+        # The wire field is relative Source pitch (positive down), not world elevation.
+        elevation = math.fmod((-elevation) % 360.0 - observer_pitch, 360.0)
+        if elevation > 180.0:
+            elevation -= 360.0
+        elif elevation < -180.0:
+            elevation += 360.0
         try:
             observer_yaw = float(observer.get("view_yaw_deg", 0.0))
         except (TypeError, ValueError):

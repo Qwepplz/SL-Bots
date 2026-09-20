@@ -364,8 +364,8 @@ def recurrent_to_hierarchical_batch(batch: RecurrentMiniBatchV1) -> Hierarchical
             up = float(actions[batch_index, step, 2])
             yaw = math.radians(float(facings[batch_index][step][0]))
             duration = max(float(durations[batch_index, step]), 1.0 / 128.0)
-            x += (forward * math.cos(yaw) - side * math.sin(yaw)) * 250.0 * duration
-            y += (forward * math.sin(yaw) + side * math.cos(yaw)) * 250.0 * duration
+            x += (forward * math.cos(yaw) + side * math.sin(yaw)) * 250.0 * duration
+            y += (forward * math.sin(yaw) - side * math.cos(yaw)) * 250.0 * duration
             z += up * 250.0 * duration
         return (x, y, z), False
 

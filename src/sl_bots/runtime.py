@@ -113,7 +113,8 @@ def _action_from_onnx_outputs(
             logistic_noise = math.log(probability / (1.0 - probability))
             offset = (-1.0, 0.0, 1.0)[component]
             sampled.append(float(mouse_loc[axis]) + (offset + logistic_noise) * float(mouse_scale[axis]))
-        mouse_values = sampled
+        # An explicit deterministic policy must not acquire random view drift.
+        mouse_values = [float(value) for value in mouse_loc] if sample_distributions is False else sampled
     if distribution_sampling:
         continuous[:3] = [
             2.0 * rng.betavariate(float(alpha), float(beta)) - 1.0
@@ -1493,6 +1494,7 @@ class MovementRuntimeStateV3:
     action_hidden: Any
     last_movement_tick: int = -1
     movement_plan: MovementPlanV1 | None = None
+    movement_rng: Any | None = None
 
 
 class MovementRuntimeServiceV3:
@@ -1512,6 +1514,7 @@ class MovementRuntimeServiceV3:
         max_bots: int = MAX_BOTS,
         tick_deadline_ms: float = 1000.0 / 128.0,
         transport: Any | None = None,
+        movement_sampling_seed: int | None = None,
     ) -> None:
         if not 1 <= int(max_bots) <= MAX_BOTS:
             raise ValueError(f"max_bots must be between 1 and {MAX_BOTS}")
@@ -1531,6 +1534,13 @@ class MovementRuntimeServiceV3:
         if not math.isfinite(self.tick_deadline_ms) or self.tick_deadline_ms <= 0.0:
             raise ValueError("tick_deadline_ms must be finite and positive")
         self.transport = transport
+        if movement_sampling_seed is not None and (
+            isinstance(movement_sampling_seed, bool)
+            or not isinstance(movement_sampling_seed, int)
+            or movement_sampling_seed < 0
+        ):
+            raise ValueError("movement_sampling_seed must be a non-negative integer or None")
+        self.movement_sampling_seed = movement_sampling_seed
         self._movement_input_names = tuple(item.name for item in movement_session.get_inputs())
         self._movement_output_names = tuple(item.name for item in movement_session.get_outputs())
         self._action_input_names = tuple(item.name for item in action_session.get_inputs())
@@ -1539,7 +1549,7 @@ class MovementRuntimeServiceV3:
             raise ValueError("v3 movement session must expose observation input")
         if self._action_input_names != ("local_observation", "movement_plan", "action_hidden"):
             raise ValueError("v3 action session has an invalid input contract")
-        self._states = [self._new_state() for _ in range(self.max_bots)]
+        self._states = [self._new_state(slot) for slot in range(self.max_bots)]
         self._last_tick = -1
         self._movement_latency_ms: list[float] = []
         self._reaction_latency_ms: list[float] = []
@@ -1571,7 +1581,7 @@ class MovementRuntimeServiceV3:
             raise RuntimeError("v3 runtime must use CPU ONNX sessions")
         return session
 
-    def _new_state(self) -> MovementRuntimeStateV3:
+    def _new_state(self, slot: int = 0) -> MovementRuntimeStateV3:
         zeros = self._np.zeros
         empty_plan = MovementPlanV1(
             move=(0, 0, 0),
@@ -1583,6 +1593,10 @@ class MovementRuntimeServiceV3:
             cached_movement_plan=zeros((75,), dtype=self._np.float32),
             action_hidden=zeros((384,), dtype=self._np.float32),
             movement_plan=empty_plan,
+            movement_rng=(
+                None if self.movement_sampling_seed is None
+                else self._np.random.default_rng([self.movement_sampling_seed, slot])
+            ),
         )
 
     @classmethod
@@ -1595,7 +1609,7 @@ class MovementRuntimeServiceV3:
         return self._states[int(slot)]
 
     def _reset_states(self) -> None:
-        self._states = [self._new_state() for _ in range(self.max_bots)]
+        self._states = [self._new_state(slot) for slot in range(self.max_bots)]
         self._last_tick = -1
 
     def reset_round(self) -> None:
@@ -1623,9 +1637,24 @@ class MovementRuntimeServiceV3:
         self._states = copy.deepcopy(list(backup))
 
     @staticmethod
-    def _plan_from_outputs(output: Mapping[str, Any], index: int) -> MovementPlanV1:
+    def _plan_from_outputs(output: Mapping[str, Any], index: int, *, rng: Any | None = None) -> MovementPlanV1:
         try:
-            move = tuple(int(value) for value in output["move_logits"][index].argmax(axis=-1).tolist())
+            logits = output["move_logits"][index]
+            if rng is None:
+                move = tuple(int(value) for value in logits.argmax(axis=-1).tolist())
+            else:
+                np = __import__("numpy")
+                logits = np.asarray(logits, dtype=np.float64)
+                if logits.shape != (3, 17) or not np.isfinite(logits).all():
+                    raise ValueError("movement logits must be finite [3,17]")
+                probabilities = np.exp(logits - logits.max(axis=-1, keepdims=True))
+                probabilities /= probabilities.sum(axis=-1, keepdims=True)
+                # One quantile couples the horizons; a cached plan is never
+                # resampled by the faster reaction loop. Stop retains its mass.
+                quantile = float(rng.random())
+                cumulative = probabilities.cumsum(axis=-1)
+                cumulative[:, -1] = 1.0
+                move = tuple(int((row < quantile).sum()) for row in cumulative)
             stance = tuple(int(value) for value in output["stance_logits"][index].argmax(axis=-1).tolist())
             jump = tuple(int(value) for value in output["jump_logits"][index].argmax(axis=-1).tolist())
             embedding = tuple(float(value) for value in output["plan_embedding"][index].tolist())
@@ -1647,18 +1676,24 @@ class MovementRuntimeServiceV3:
         try:
             outputs = self.movement_session.run(None, {"observation": values})
             output = dict(zip(self._movement_output_names, outputs))
-            plans = tuple(self._plan_from_outputs(output, index) for index in range(len(observations)))
+            plans = tuple(
+                self._plan_from_outputs(output, index, rng=self._states[index].movement_rng)
+                for index in range(len(observations))
+            )
         except Exception:
             self._movement_latency_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
             return False
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
         self._movement_latency_ms.append(elapsed_ms)
+        self._install_movement_plans(plans, server_tick)
+        return True
+
+    def _install_movement_plans(self, plans: Sequence[MovementPlanV1], server_tick: int) -> None:
         for index, plan in enumerate(plans):
             state = self._states[index]
             state.movement_plan = plan
             state.cached_movement_plan = self._np.asarray(plan.plan_embedding, dtype=self._np.float32).copy()
             state.last_movement_tick = int(server_tick)
-        return True
 
     def _reaction_actions(
         self,
@@ -1745,6 +1780,10 @@ class MovementRuntimeServiceV3:
             and (
                 self._last_tick < 0
                 or server_tick % self.MOVEMENT_REFRESH_TICKS == 0
+                or any(
+                    server_tick - state.last_movement_tick >= self.MOVEMENT_REFRESH_TICKS
+                    for state in self._states[:len(normalized)]
+                )
                 or bool(important_events)
             )
         )
@@ -1826,6 +1865,93 @@ class MovementRuntimeServiceV3:
             "reaction_failure_count": self._reaction_failure_count,
             "deadline_miss_count": self._deadline_miss_count,
         }
+
+
+class AsyncMovementRuntimeServiceV3(MovementRuntimeServiceV3):
+    """One bounded movement job; reaction actions retain current-tick inputs."""
+
+    def __init__(self, *, greedy_on_visible_enemy: bool = False, **kwargs: Any) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not isinstance(greedy_on_visible_enemy, bool):
+            raise ValueError("greedy_on_visible_enemy must be a bool")
+        self.greedy_on_visible_enemy = greedy_on_visible_enemy
+        self._visible_enemies: tuple[bool, ...] = ()
+        super().__init__(**kwargs)
+        self._movement_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="slbots-movement")
+        self._pending_movement = None
+        self._movement_roster = None
+
+    def _reset_states(self) -> None:
+        self._discard_pending_movement()
+        self._movement_roster = None
+        super()._reset_states()
+
+    def _discard_pending_movement(self) -> None:
+        if self._pending_movement is not None:
+            self._pending_movement[0].cancel()
+            self._pending_movement = None
+
+    def close(self) -> None:
+        self._discard_pending_movement()
+        self._movement_executor.shutdown(wait=True, cancel_futures=True)
+
+    def restore_backup(self, backup: Sequence[MovementRuntimeStateV3]) -> None:
+        self._discard_pending_movement()
+        self._movement_roster = None
+        super().restore_backup(backup)
+
+    def process_tick(self, observations: Sequence[BotObservationV1], *, server_tick: int,
+                     important_events: Sequence[Any] = ()) -> tuple[BotActionV1, ...]:
+        roster = tuple(observation.to_bytes()[8:10] for observation in observations)
+        if self._movement_roster is not None and roster != self._movement_roster:
+            if server_tick <= self._last_tick:
+                raise ValueError("server_tick must advance monotonically")
+            self._reset_states()
+        if self.greedy_on_visible_enemy:
+            self._visible_enemies = tuple(
+                any(raw[offset + 2] == 255 and raw[offset + 3] & 9 == 9
+                    for offset in range(44, 152, 12))
+                for raw in (observation.to_bytes() for observation in observations)
+            )
+        return super().process_tick(observations, server_tick=server_tick, important_events=important_events)
+
+    def _plan_from_outputs(self, output: Mapping[str, Any], index: int, *, rng: Any = None) -> MovementPlanV1:
+        if self.greedy_on_visible_enemy and index < len(self._visible_enemies) and self._visible_enemies[index]:
+            rng = None
+        return super()._plan_from_outputs(output, index, rng=rng)
+
+    def _refresh_movement(self, observations: Sequence[BotObservationV1], server_tick: int) -> bool:
+        roster = tuple(observation.to_bytes()[8:10] for observation in observations)
+        if roster != self._movement_roster:
+            self._discard_pending_movement()
+            self._movement_roster = roster
+            return super()._refresh_movement(observations, server_tick)
+        if self._pending_movement is not None:
+            future, source_tick = self._pending_movement
+            if not future.done():
+                return True
+            self._pending_movement = None
+            try:
+                outputs, elapsed_ms = future.result()
+                self._movement_latency_ms.append(elapsed_ms)
+                if (server_tick - source_tick) / self.ACTION_HZ >= self.STALE_FALLBACK_SECONDS:
+                    return False
+                output = dict(zip(self._movement_output_names, outputs))
+                plans = tuple(self._plan_from_outputs(output, index, rng=self._states[index].movement_rng)
+                              for index in range(len(observations)))
+                self._install_movement_plans(plans, source_tick)
+                return True
+            except Exception:
+                return False
+        values = self._np.stack([self._np.frombuffer(observation.to_bytes(), dtype=self._np.uint8)
+                                 .astype(self._np.float32) / 255.0 for observation in observations])
+        def infer():
+            started = time.perf_counter_ns()
+            outputs = self.movement_session.run(None, {"observation": values})
+            return outputs, (time.perf_counter_ns() - started) / 1_000_000.0
+        self._pending_movement = (self._movement_executor.submit(infer), int(server_tick))
+        return True
 
 
 def runtime_for_package(package: Any, **kwargs: Any) -> Any:

@@ -92,6 +92,7 @@ public Plugin myinfo = {
 };
 
 public void OnPluginStart() {
+    RegServerCmd("sl_bots_control_status", Command_ControlStatus);
     CreateConVar("sl_bots_instance_id", "", "Dedicated server instance suffix for SL-Bots IPC", FCVAR_PROTECTED);
     g_ControlPolicyGenerationCvar = CreateConVar(
         "sl_bots_policy_generation",
@@ -138,6 +139,19 @@ public void OnPluginStart() {
     g_ControlPaused = false;
     ResetRuntimeState();
     OpenTransport();
+}
+
+public Action Command_ControlStatus(int args) {
+    PrintToServer("{\"tick\":%d,\"epoch\":%d,\"last_action_tick\":%d}", GetGameTickCount(), g_Epoch, g_LastActionTick);
+    for (int slot = 0; slot < SLBOTS_MAX_BOTS; slot++) {
+        int client = g_BotClients[slot];
+        if (client <= 0 || !IsClientInGame(client) || !IsFakeClient(client)) {
+            continue;
+        }
+        PrintToServer("{\"userid\":%d,\"fallback\":%d,\"missing_consecutive\":%d,\"missing_window\":%d}",
+            GetClientUserId(client), g_BotPermanentFallback[slot], g_MissingConsecutive[slot], g_MissingWindowCount[slot]);
+    }
+    return Plugin_Handled;
 }
 
 public void OnMapStart() {
@@ -620,7 +634,7 @@ void BuildObservation(int packet[SLBOTS_OBSERVATION_PACKET_WORDS], int base, int
     SetPacketInt16(packet, base + 22, RoundToNearest(eyeAngles[0] * 10.0));
     SetPacketByte(packet, base + 24, ClampInt(RoundToNearest(velocity[0] / 16.0), -128, 127));
     SetPacketByte(packet, base + 25, ClampInt(RoundToNearest(velocity[1] / 16.0), -128, 127));
-    SetPacketByte(packet, base + 26, GetEntityFlags(client) & 0xFF);
+    SetPacketByte(packet, base + 26, EncodeSelfFlags(client));
     SetPacketByte(packet, base + 27, EncodeSelfEffects(client));
     SetPacketByte(packet, base + 28, 191);
     SetPacketByte(packet, base + 29, 191);
@@ -742,7 +756,7 @@ void WritePlayerObservation(
     SetPacketByte(packet, offset + 2, teammate ? 1 : -1);
     SetPacketByte(packet, offset + 3, flags);
     SetPacketInt16(packet, offset + 4, ClampInt(RoundToNearest(bearing * 100.0), -32768, 32767));
-    SetPacketByte(packet, offset + 6, ClampInt(RoundToNearest(targetAngles[0] - observerAngles[0]), -128, 127));
+    SetPacketByte(packet, offset + 6, ClampInt(RoundToNearest(NormalizeYaw(targetAngles[0] - observerAngles[0])), -128, 127));
     SetPacketInt16(packet, offset + 7, ClampInt(RoundToNearest(distance), 0, 65535));
     int ageDeciseconds = delayed ? ClampInt(
         RoundToNearest(float(GetGameTickCount() - g_LastKnownTick[observer][target]) * 10.0 / 128.0),
@@ -909,6 +923,22 @@ int EncodeSmokeOcclusion(int client) {
     return ClampInt(RoundToNearest(SmokeOcclusionAt(position) * 255.0), 0, 255);
 }
 
+int EncodeSelfFlags(int client) {
+    // ObservationProjectionV1 bits are not Source engine entity flags.
+    int flags = 0;
+    int entityFlags = GetEntityFlags(client);
+    if (IsPlayerAlive(client)) { flags |= 1 << 0; }
+    if ((entityFlags & FL_DUCKING) != 0) { flags |= 1 << 1; }
+    if (HasEntProp(client, Prop_Send, "m_bIsWalking") && GetEntProp(client, Prop_Send, "m_bIsWalking")) { flags |= 1 << 2; }
+    if (HasEntProp(client, Prop_Send, "m_bIsScoped") && GetEntProp(client, Prop_Send, "m_bIsScoped")) { flags |= 1 << 3; }
+    if (IsPlayerAlive(client) && (entityFlags & FL_ONGROUND) == 0) { flags |= 1 << 4; }
+    if (EncodeFlashRecovery(client) < 255) { flags |= 1 << 5; }
+    if (HasEntProp(client, Prop_Send, "m_bIsDefusing") && GetEntProp(client, Prop_Send, "m_bIsDefusing")) { flags |= 1 << 6; }
+    int weapon = CurrentWeaponEntity(client);
+    if (weapon > MaxClients && IsValidEntity(weapon) && HasEntProp(weapon, Prop_Send, "m_bStartedArming") && GetEntProp(weapon, Prop_Send, "m_bStartedArming")) { flags |= 1 << 7; }
+    return flags;
+}
+
 int EncodeSelfEffects(int client) {
     int flash = ClampInt(RoundToNearest(float(EncodeFlashRecovery(client)) / 255.0 * 63.0), 0, 63);
     int smoke = ClampInt(RoundToNearest(float(EncodeSmokeOcclusion(client)) / 255.0 * 3.0), 0, 3);
@@ -930,6 +960,11 @@ int CurrentWeaponEntity(int client) {
 int WeaponModelId(int weapon) {
     if (weapon <= MaxClients || !IsValidEntity(weapon) || !HasEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex")) {
         return 0;
+    }
+    char classname[64];
+    GetEntityClassname(weapon, classname, sizeof(classname));
+    if (StrEqual(classname, "weapon_c4")) {
+        return 14;
     }
     int definition = GetEntProp(weapon, Prop_Send, "m_iItemDefinitionIndex");
     switch (definition) {
