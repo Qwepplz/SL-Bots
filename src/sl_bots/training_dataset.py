@@ -62,6 +62,9 @@ class RecurrentMiniBatchV1:
     sequence_ids: tuple[tuple[str, ...], ...]
     target_ticks: Any | None = None
     context: Mapping[str, Any] = field(default_factory=dict)
+    burn_in_mask: Any | None = None
+    detach_mask: Any | None = None
+    sequence_start_mask: Any | None = None
 
     @property
     def batch_size(self) -> int:
@@ -76,6 +79,9 @@ class RecurrentMiniBatchV1:
             duration_s=self.duration_s.to(device),
             hidden_state_mask=self.hidden_state_mask.to(device),
             target_ticks=None if self.target_ticks is None else self.target_ticks.to(device),
+            burn_in_mask=None if self.burn_in_mask is None else self.burn_in_mask.to(device),
+            detach_mask=None if self.detach_mask is None else self.detach_mask.to(device),
+            sequence_start_mask=None if self.sequence_start_mask is None else self.sequence_start_mask.to(device),
             context={
                 key: value.to(device) if hasattr(value, "to") else value
                 for key, value in self.context.items()
@@ -331,6 +337,115 @@ def iter_recurrent_minibatches(
         yield _normalize_window(pending, sequence_length)
 
 
+def _continuous_path_windows(path: Path, sequence_length: int, *, random_window: bool, rng: random.Random) -> Iterator[list[dict[str, Any]]]:
+    rows_by_sequence: dict[str, list[dict[str, Any]]] = {}
+    for row in _iter_rows(path, sequence_length):
+        rows_by_sequence.setdefault(str(row["sequence_id"]), []).append(row)
+    for rows in rows_by_sequence.values():
+        if random_window and len(rows) > sequence_length:
+            starts = list(range(0, len(rows) - sequence_length + 1, max(1, sequence_length // 2)))
+            if starts[-1] != len(rows) - sequence_length:
+                starts.append(len(rows) - sequence_length)
+        else:
+            starts = list(range(0, len(rows), sequence_length))
+        previous_start: int | None = None
+        for start in starts:
+            window = [dict(row) for row in rows[start : start + sequence_length]]
+            if window:
+                window[0]["_window_continuation"] = (
+                    previous_start is not None and start == previous_start + sequence_length
+                )
+                window[0]["_window_burn_in"] = bool(random_window and start > 0)
+                previous_start = start
+            yield window
+
+
+def iter_continuous_recurrent_minibatches(
+    paths: Sequence[Path],
+    sequence_length: int,
+    batch_sequences: int,
+    seed: int,
+    *,
+    burn_in_ticks: int = 32,
+    random_windows: bool = False,
+) -> Iterator[RecurrentMiniBatchV1]:
+    """Yield v3 windows with continuation/detach and burn-in metadata.
+
+    A continuation window keeps the incoming hidden state at its first row and
+    marks that row for detach.  Only a true sequence start clears the hidden
+    state.  Burn-in rows are retained for state evolution but have zero loss.
+
+    Windows for one sequence are yielded in temporal order and are never put in
+    the same batch.  This makes the caller's batch-consumption order sufficient
+    for committing the preceding window's final hidden state before the next
+    continuation window requests it.
+    """
+
+    if sequence_length <= 0 or batch_sequences <= 0:
+        raise ValueError("sequence_length and batch_sequences must be positive")
+    if burn_in_ticks < 0 or burn_in_ticks >= sequence_length:
+        raise ValueError("burn_in_ticks must be in [0, sequence_length)")
+    pending: list[list[dict[str, Any]]] = []
+    pending_continuation: list[bool] = []
+    for path_index, path in enumerate(tuple(Path(value).resolve() for value in paths)):
+        rng = random.Random(seed + path_index * 1_000_003)
+        for window in _continuous_path_windows(path, sequence_length, random_window=random_windows, rng=rng):
+            if not window:
+                continue
+            sequence_id = str(window[0]["sequence_id"])
+            pending_sequence_ids = {str(value[0]["sequence_id"]) for value in pending if value}
+            if pending and sequence_id in pending_sequence_ids:
+                yield _normalize_continuous_windows(pending, pending_continuation, sequence_length, burn_in_ticks)
+                pending = []
+                pending_continuation = []
+            pending.append(window)
+            pending_continuation.append(bool(window[0].get("_window_continuation", False)))
+            if len(pending) == batch_sequences:
+                yield _normalize_continuous_windows(pending, pending_continuation, sequence_length, burn_in_ticks)
+                pending = []
+                pending_continuation = []
+    if pending:
+        yield _normalize_continuous_windows(pending, pending_continuation, sequence_length, burn_in_ticks)
+
+
+def _normalize_continuous_windows(
+    windows: Sequence[Sequence[Mapping[str, Any]]],
+    continuations: Sequence[bool],
+    sequence_length: int,
+    burn_in_ticks: int,
+) -> RecurrentMiniBatchV1:
+    batch = _normalize_window(windows, sequence_length)
+    torch = _torch()
+    hidden_state_mask = torch.zeros((sequence_length, len(windows)), dtype=torch.bool)
+    burn_in_mask = torch.zeros((sequence_length, len(windows)), dtype=torch.bool)
+    detach_mask = torch.zeros((sequence_length, len(windows)), dtype=torch.bool)
+    sequence_start_mask = torch.zeros((sequence_length, len(windows)), dtype=torch.bool)
+    for batch_index, (window, continuation) in enumerate(zip(windows, continuations, strict=True)):
+        for time_index in range(min(sequence_length, len(window))):
+            hidden_state_mask[time_index, batch_index] = continuation or time_index > 0
+        if not continuation and window:
+            sequence_start_mask[0, batch_index] = True
+        if continuation:
+            detach_mask[0, batch_index] = True
+        if continuation or bool(window[0].get("_window_burn_in", False)):
+            burn_in_mask[: min(burn_in_ticks, len(window)), batch_index] = True
+    loss_masks = batch.loss_masks.clone()
+    loss_masks[burn_in_mask] = 0
+    context = dict(batch.context)
+    context["burn_in_mask"] = burn_in_mask
+    context["detach_mask"] = detach_mask
+    context["sequence_start_mask"] = sequence_start_mask
+    return replace(
+        batch,
+        loss_masks=loss_masks,
+        hidden_state_mask=hidden_state_mask,
+        burn_in_mask=burn_in_mask,
+        detach_mask=detach_mask,
+        sequence_start_mask=sequence_start_mask,
+        context=context,
+    )
+
+
 def sequence_paths(manifest: DatasetManifestV1, split: str) -> tuple[Path, ...]:
     if not isinstance(manifest, DatasetManifestV1):
         raise TypeError("manifest must be DatasetManifestV1")
@@ -476,6 +591,7 @@ def _sequence_manifest(
             "ruleset": "mr15",
             "regulation_max_rounds": "30",
             "demo_sha256": entry.sha256,
+            "source_demo_folder": entry.path.parent.name,
         },
     )
 
@@ -533,7 +649,7 @@ def _convert_demo(
             human_records.append(
                 _human_record(current, following, player_id, action.duration_s)
             )
-        output = sequence_root / split / (
+        output = sequence_root / split / entry.path.parent.name / (
             f"{_safe_filename(entry.sha256[:16])}-r{_safe_filename(round_number)}-p{_safe_filename(player_id)}.parquet"
         )
         overtime = any(
@@ -553,6 +669,7 @@ def _convert_demo(
                 "ruleset": "mr15",
                 "regulation_max_rounds": "30",
                 "demo_sha256": entry.sha256,
+                "source_demo_folder": entry.path.parent.name,
                 "overtime": str(overtime).lower(),
             },
         )
@@ -624,6 +741,20 @@ def ingest_demo_corpus(
         "splits_json": json.dumps(
             {
                 split: [entry.sha256 for entry in split_values]
+                for split, split_values in split_entries.items()
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "source_demo_folders_json": json.dumps(
+            {
+                split: [
+                    {
+                        "sha256": entry.sha256,
+                        "source_demo_folder": entry.path.parent.name,
+                    }
+                    for entry in split_values
+                ]
                 for split, split_values in split_entries.items()
             },
             sort_keys=True,

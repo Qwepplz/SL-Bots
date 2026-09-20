@@ -187,6 +187,28 @@ ACTION_OUTPUT_NAMES = (
     "buy_logits",
     "next_action_hidden",
 )
+MOVEMENT_INPUT_NAMES = ("observation",)
+MOVEMENT_OUTPUT_NAMES = ("move_logits", "stance_logits", "jump_logits", "plan_embedding")
+REACTIVE_ACTION_INPUT_NAMES = ("local_observation", "movement_plan", "action_hidden")
+REACTIVE_ACTION_OUTPUT_NAMES = (
+    "mouse_loc",
+    "mouse_scale",
+    "mouse_mix_logits",
+    "button_logits",
+    "weapon_logits",
+    "buy_logits",
+    "next_hidden",
+    "plan_condition",
+)
+
+
+def prepare_movement_qat(model: Any) -> Any:
+    """Attach the same float-master fake-quant boundary used by v3 movement."""
+
+    _require_torch()
+    _replace_linear_children(model)
+    setattr(model, "_movement_qat_prepared", True)
+    return model
 
 
 def _export_onnx_model(model: Any, path: Path, *, kind: str) -> None:
@@ -260,6 +282,56 @@ def _export_onnx_model(model: Any, path: Path, *, kind: str) -> None:
         input_names = ACTION_INPUT_NAMES
         output_names = ACTION_OUTPUT_NAMES
         dynamic_axes = {name: {0: "batch"} for name in (*input_names, *output_names)}
+    elif kind == "movement":
+
+        class MovementWrapper(torch_module.nn.Module):
+            def __init__(self, wrapped: Any) -> None:
+                super().__init__()
+                self.wrapped = wrapped
+
+            def forward(self, observation: Any) -> Any:
+                output = self.wrapped(observation)
+                return (
+                    output.move_logits,
+                    output.stance_logits,
+                    output.jump_logits,
+                    output.plan_embedding,
+                )
+
+        wrapper = MovementWrapper(model)
+        arguments = (torch_module.zeros(1, 256, dtype=torch_module.float32),)
+        input_names = MOVEMENT_INPUT_NAMES
+        output_names = MOVEMENT_OUTPUT_NAMES
+        dynamic_axes = {name: {0: "batch"} for name in (*input_names, *output_names)}
+    elif kind == "reactive_action":
+
+        class ReactiveActionWrapper(torch_module.nn.Module):
+            def __init__(self, wrapped: Any) -> None:
+                super().__init__()
+                self.wrapped = wrapped
+
+            def forward(self, local_observation: Any, movement_plan: Any, action_hidden: Any) -> Any:
+                output = self.wrapped(local_observation, movement_plan, action_hidden)
+                return (
+                    output.mouse_loc,
+                    output.mouse_scale,
+                    output.mouse_mix_logits,
+                    output.button_logits,
+                    output.weapon_logits,
+                    output.buy_logits,
+                    output.next_hidden,
+                    output.plan_condition,
+                )
+
+        wrapper = ReactiveActionWrapper(model)
+        arguments = (
+            torch_module.zeros(1, 256, dtype=torch_module.float32),
+            torch_module.zeros(1, 75, dtype=torch_module.float32),
+            torch_module.zeros(1, 384, dtype=torch_module.float32),
+        )
+        input_names = REACTIVE_ACTION_INPUT_NAMES
+        output_names = REACTIVE_ACTION_OUTPUT_NAMES
+        dynamic_axes = {name: {0: "batch"} for name in (*input_names, *output_names)}
     else:
         raise ValueError(f"unsupported ONNX model kind: {kind}")
     model.eval()
@@ -312,6 +384,45 @@ def export_action_fp32(model: Any, output_path: str | Path) -> Path:
     prepare_action_fp32(model)
     destination = Path(output_path)
     _export_onnx_model(model, destination, kind="action")
+    return destination
+
+
+def export_movement_int8(model: Any, output_path: str | Path) -> Path:
+    """Export the QAT-prepared movement branch and dynamically quantize its weights."""
+
+    _require_torch()
+    if not contains_fake_quant(model):
+        raise ValueError("movement INT8 export requires a QAT-prepared movement model")
+    try:
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+    except ImportError as error:  # pragma: no cover - dependency boundary
+        raise RuntimeError("onnxruntime is required for INT8 movement export") from error
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    export_model = copy.deepcopy(model).cpu()
+    freeze_qat_observers(export_model)
+    with tempfile.TemporaryDirectory(prefix="sl-bots-movement-", dir=destination.parent) as directory:
+        float_path = Path(directory) / "movement.float.onnx"
+        _replace_qat_for_export(export_model)
+        _export_onnx_model(export_model, float_path, kind="movement")
+        _fold_initializer_transposes(float_path)
+        quantize_dynamic(
+            str(float_path),
+            str(destination),
+            weight_type=QuantType.QInt8,
+            per_channel=False,
+            reduce_range=False,
+        )
+    return destination
+
+
+def export_reactive_action_fp32(model: Any, output_path: str | Path) -> Path:
+    """Export the v3 reaction branch without any quantization observers."""
+
+    _require_torch()
+    prepare_action_fp32(model)
+    destination = Path(output_path)
+    _export_onnx_model(model, destination, kind="reactive_action")
     return destination
 
 
@@ -499,6 +610,30 @@ def validate_action_fp32_graph(path: str | Path) -> dict[str, Any]:
     return report
 
 
+def validate_movement_int8_graph(path: str | Path) -> dict[str, Any]:
+    """Require real INT8/QDQ evidence for every supported movement weight."""
+
+    report = _graph_report(path)
+    if report["supported_weight_nodes"] <= 0:
+        raise ValueError("movement graph has no supported dense weight node")
+    if report["unquantized_weight_nodes"]:
+        raise ValueError(
+            "movement graph has unquantized supported weights: "
+            + ", ".join(report["unquantized_weight_nodes"])
+        )
+    if report["quantized_weight_nodes"] != report["supported_weight_nodes"]:
+        raise ValueError("movement graph does not quantize every supported dense weight")
+    if not report["has_qdq_or_integer_node"]:
+        raise ValueError("movement graph has no Q/DQ or integer quantization node")
+    return report
+
+
+def validate_reactive_action_fp32_graph(path: str | Path) -> dict[str, Any]:
+    """Alias with a v3-specific name to make the movement/action boundary explicit."""
+
+    return validate_action_fp32_graph(path)
+
+
 def _compare_outputs(expected: Any, actual: Any) -> dict[str, float]:
     import numpy as np
 
@@ -593,6 +728,84 @@ def compare_action_onnx(
         {
             "local_observation": local_observation.detach().cpu().numpy(),
             "cached_intent": cached_intent.detach().cpu().numpy(),
+            "action_hidden": action_hidden.detach().cpu().numpy(),
+        },
+    )
+    errors = [_compare_outputs(expected_value, actual_value) for expected_value, actual_value in zip(expected, actual)]
+    return {
+        "max_abs_error": max(error["max_abs_error"] for error in errors),
+        "mean_abs_error": sum(error["mean_abs_error"] for error in errors) / len(errors),
+    }
+
+
+def compare_movement_onnx(model: Any, path: str | Path, observation: Any) -> dict[str, Any]:
+    """Compare Torch and INT8 movement outputs, including classification argmaxes."""
+
+    try:
+        import onnxruntime as ort
+    except ImportError as error:  # pragma: no cover - dependency boundary
+        raise RuntimeError("onnxruntime is required for output comparison") from error
+    model.eval()
+    with torch.no_grad():
+        output = model(observation)
+        expected = (
+            output.move_logits,
+            output.stance_logits,
+            output.jump_logits,
+            output.plan_embedding,
+        )
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    actual = session.run(
+        list(MOVEMENT_OUTPUT_NAMES),
+        {"observation": observation.detach().cpu().numpy()},
+    )
+    errors = [_compare_outputs(expected_value, actual_value) for expected_value, actual_value in zip(expected, actual)]
+    argmax_equal = all(
+        torch.equal(
+            expected_value.detach().cpu().argmax(dim=-1),
+            torch.from_numpy(actual_value).argmax(dim=-1),
+        )
+        for expected_value, actual_value in zip(expected[:3], actual[:3])
+    )
+    return {
+        "max_abs_error": max(error["max_abs_error"] for error in errors),
+        "mean_abs_error": sum(error["mean_abs_error"] for error in errors) / len(errors),
+        "argmax_equal": bool(argmax_equal),
+    }
+
+
+def compare_reactive_action_onnx(
+    model: Any,
+    path: str | Path,
+    local_observation: Any,
+    movement_plan: Any,
+    action_hidden: Any,
+) -> dict[str, float]:
+    """Compare Torch and FP32 ONNX reaction outputs."""
+
+    try:
+        import onnxruntime as ort
+    except ImportError as error:  # pragma: no cover - dependency boundary
+        raise RuntimeError("onnxruntime is required for output comparison") from error
+    model.eval()
+    with torch.no_grad():
+        output = model(local_observation, movement_plan, action_hidden)
+        expected = (
+            output.mouse_loc,
+            output.mouse_scale,
+            output.mouse_mix_logits,
+            output.button_logits,
+            output.weapon_logits,
+            output.buy_logits,
+            output.next_hidden,
+            output.plan_condition,
+        )
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    actual = session.run(
+        list(REACTIVE_ACTION_OUTPUT_NAMES),
+        {
+            "local_observation": local_observation.detach().cpu().numpy(),
+            "movement_plan": movement_plan.detach().cpu().numpy(),
             "action_hidden": action_hidden.detach().cpu().numpy(),
         },
     )

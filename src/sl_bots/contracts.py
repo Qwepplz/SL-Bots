@@ -52,6 +52,12 @@ HIERARCHICAL_STATE_SCHEMA = {
     "last_decision_tick": "int64[batch]",
 }
 
+MOVEMENT_STATE_SCHEMA_V3 = {
+    "cached_movement_plan": "float32[batch,75]",
+    "action_hidden": "float32[batch,384]",
+    "last_movement_tick": "int64[batch]",
+}
+
 
 @dataclass(frozen=True)
 class HierarchicalPackageV2:
@@ -146,6 +152,105 @@ class HierarchicalPackageV2:
             decision_sha256=str(payload["decision_sha256"]),
             action_sha256=str(payload["action_sha256"]),
             decision_parameter_count=int(payload.get("decision_parameter_count", 0)),
+            action_parameter_count=int(payload.get("action_parameter_count", 0)),
+            state_schema=payload["state_schema"],
+            metadata=payload.get("metadata", {}),
+        )
+
+
+@dataclass(frozen=True)
+class HierarchicalPackageV3:
+    """Atomic manifest for the stateless movement and reaction v3 artifacts."""
+
+    generation: int
+    movement_path: Path
+    action_path: Path
+    purpose: DataPurpose
+    movement_sha256: str
+    action_sha256: str
+    state_schema: Mapping[str, str]
+    parent_generation: int | None = None
+    movement_parameter_count: int = 0
+    action_parameter_count: int = 0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 0:
+            raise ValueError("package generation must be a non-negative integer")
+        if self.generation == 0 and self.parent_generation is not None:
+            raise ValueError("generation 0 cannot have a parent generation")
+        if self.generation > 0 and self.parent_generation != self.generation - 1:
+            raise ValueError("package parent must be exactly generation - 1")
+        object.__setattr__(self, "movement_path", Path(self.movement_path).resolve())
+        object.__setattr__(self, "action_path", Path(self.action_path).resolve())
+        object.__setattr__(self, "purpose", ensure_purpose(self.purpose))
+        for name in ("movement_sha256", "action_sha256"):
+            digest = str(getattr(self, name)).lower()
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError(f"{name} must be a 64-character hexadecimal digest")
+            object.__setattr__(self, name, digest)
+        state_schema = dict(self.state_schema)
+        if state_schema != MOVEMENT_STATE_SCHEMA_V3:
+            raise ValueError("state schema does not match movement v3 actor contract")
+        object.__setattr__(self, "state_schema", state_schema)
+        object.__setattr__(self, "metadata", dict(self.metadata))
+        if self.movement_parameter_count < 0 or self.action_parameter_count < 0:
+            raise ValueError("package parameter counts must be non-negative")
+
+    def assert_loadable(self) -> None:
+        if self.purpose is not DataPurpose.TEST_ONLY:
+            raise ValueError("movement v3 package must remain test_only")
+        metadata_purpose = self.metadata.get("purpose")
+        lineage = self.metadata.get("training_lineage")
+        lineage_purpose = lineage.get("purpose") if isinstance(lineage, Mapping) else None
+        if metadata_purpose != DataPurpose.TEST_ONLY.value or lineage_purpose != DataPurpose.TEST_ONLY.value:
+            raise ValueError("movement v3 package lineage must be test_only")
+        for path in (self.movement_path, self.action_path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            if path.stat().st_size <= 0:
+                raise ValueError(f"movement v3 package artifact is empty: {path}")
+        import hashlib
+
+        for path, expected, name in (
+            (self.movement_path, self.movement_sha256, "movement"),
+            (self.action_path, self.action_sha256, "action"),
+        ):
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual != expected:
+                raise ValueError(f"{name} artifact hash does not match package manifest")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "hierarchical-package-v3",
+            "generation": self.generation,
+            "parent_generation": self.parent_generation,
+            "movement_path": str(self.movement_path),
+            "action_path": str(self.action_path),
+            "purpose": self.purpose.value,
+            "movement_sha256": self.movement_sha256,
+            "action_sha256": self.action_sha256,
+            "movement_parameter_count": self.movement_parameter_count,
+            "action_parameter_count": self.action_parameter_count,
+            "state_schema": dict(self.state_schema),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "HierarchicalPackageV3":
+        if payload.get("schema") != "hierarchical-package-v3":
+            raise ValueError("package manifest schema must be hierarchical-package-v3")
+        return cls(
+            generation=int(payload["generation"]),
+            parent_generation=(
+                None if payload.get("parent_generation") is None else int(payload["parent_generation"])
+            ),
+            movement_path=Path(payload["movement_path"]),
+            action_path=Path(payload["action_path"]),
+            purpose=payload["purpose"],
+            movement_sha256=str(payload["movement_sha256"]),
+            action_sha256=str(payload["action_sha256"]),
+            movement_parameter_count=int(payload.get("movement_parameter_count", 0)),
             action_parameter_count=int(payload.get("action_parameter_count", 0)),
             state_schema=payload["state_schema"],
             metadata=payload.get("metadata", {}),

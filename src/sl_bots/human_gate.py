@@ -12,6 +12,7 @@ from typing import Any
 
 from .rewards import human_metric_regression_fraction
 from .training_gail import compute_human_like_metrics
+from .movement_evaluation import movement_evidence_is_accepted
 
 
 _MISSING = object()
@@ -228,6 +229,16 @@ def _package_metrics(package: Any) -> dict[str, float]:
     return result
 
 
+def _package_movement_evidence(package: Any) -> Mapping[str, Any] | None:
+    """Read optional v3 movement evidence without treating it as legacy metrics."""
+
+    for name in ("movement_evidence", "movement_gate", "movement_metrics"):
+        value = _evidence_value(package, name, _MISSING)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return None
+
+
 def _isolate_pending_pointer(path: Path) -> Path | None:
     if not path.is_file():
         return None
@@ -274,6 +285,15 @@ def evaluate_human_gate(
 
     baseline_metrics = _package_metrics(baseline_package)
     candidate_metrics = _package_metrics(candidate_package)
+    baseline_movement = _package_movement_evidence(baseline_package)
+    candidate_movement = _package_movement_evidence(candidate_package)
+    for package_name, movement_evidence in (
+        ("baseline", baseline_movement),
+        ("candidate", candidate_movement),
+    ):
+        movement_status = movement_evidence_is_accepted(movement_evidence)
+        if movement_status is False:
+            reasons.append(f"movement v3 gate rejected {package_name} evidence")
     required_metrics = set(REQUIRED_HUMAN_METRICS)
     for package_name, metrics in (("baseline", baseline_metrics), ("candidate", candidate_metrics)):
         missing = sorted(required_metrics - set(metrics))
@@ -336,6 +356,10 @@ def evaluate_human_gate(
         "baseline_sha256": baseline_sha,
         "candidate_sha256": candidate_sha,
         "active_pointer": None if active_pointer is None else str(active_pointer),
+        "movement": {
+            "baseline": baseline_movement,
+            "candidate": candidate_movement,
+        },
     }
     rejected_path: Path | None = None
     if reasons and pending_pointer is not None:

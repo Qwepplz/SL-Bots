@@ -1437,6 +1437,7 @@ class TestTrainingPipeline:
         probe_stage_runner: Callable[..., Any] | None = None,
         gate_evidence_builder: Callable[..., Any] | None = None,
         finalizer: Callable[[], Any] | None = None,
+        auto_selfplay_after_offline_gate: bool = False,
     ) -> None:
         if not isinstance(config, HierarchicalTestConfigV1):
             raise TypeError("config must be HierarchicalTestConfigV1")
@@ -1463,6 +1464,8 @@ class TestTrainingPipeline:
         self.update_count = 0
         self.candidate_export_count = 0
         self._single_wave_executed = False
+        self.offline_gate_reached = False
+        self.auto_selfplay_after_offline_gate = bool(auto_selfplay_after_offline_gate)
 
     def run_probe_stage(self, baseline: Any) -> tuple[Any, Any]:
         """Bind capacity/timescale selected by persisted or live probes."""
@@ -1591,6 +1594,17 @@ class TestTrainingPipeline:
                     pass
             baseline = _package_with_gate_evidence(baseline, evidence)
         self.active_package = baseline
+        self.offline_gate_reached = True
+        return baseline
+
+    def run_offline_gate(self) -> object:
+        """Run the offline Demo stage and stop before any self-play side effect."""
+
+        baseline = self.run_demo_stage()
+        if self.auto_selfplay_after_offline_gate:
+            raise RuntimeError(
+                "automatic self-play after the offline gate is disabled for the test-only pipeline"
+            )
         return baseline
 
     def run_single_selfplay_wave(

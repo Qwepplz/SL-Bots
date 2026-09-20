@@ -298,7 +298,8 @@ def ingest_demo(
     if header.map_name != "de_mirage":
         raise ValueError("only de_mirage is supported")
     root = Path(data_root).resolve()
-    output = root / "raw" / f"{source.stem}.arrow"
+    source_demo_folder = source.parent.name
+    output = root / "raw" / source_demo_folder / f"{source.stem}.arrow"
     extractor = Path(extractor_path).resolve() if extractor_path else _default_extractor()
     if extractor is not None and extractor.is_file():
         completed = subprocess.run(
@@ -344,6 +345,7 @@ def ingest_demo(
         metadata={
             "map_name": header.map_name,
             "raw_arrow_path": str(output),
+            "source_demo_folder": source_demo_folder,
             "extractor_mode": extractor_mode,
             "demo_protocol": str(header.demo_protocol),
             "network_protocol": str(header.network_protocol),

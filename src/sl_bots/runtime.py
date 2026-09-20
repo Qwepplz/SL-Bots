@@ -21,6 +21,8 @@ from .contracts import (
     ActionBatchV1,
     BotActionV1,
     BotObservationV1,
+    HierarchicalPackageV2,
+    HierarchicalPackageV3,
     INTENT_TASKS,
     IntentV1,
     Phase,
@@ -29,6 +31,11 @@ from .contracts import (
     ObservationBatchV1,
 )
 from .intent import canonicalize_intent, guard_action, guard_friendly_fire
+from .movement import (
+    MovementPlanV1,
+    decode_movement_plan,
+    merge_movement_and_reaction,
+)
 
 
 ACTION_MASK_ALL = 0xFF
@@ -1476,6 +1483,373 @@ class HierarchicalRuntimeService:
             self._deadline_miss_count += 1
         self._last_tick = server_tick
         return actions
+
+
+@dataclass
+class MovementRuntimeStateV3:
+    """Per-Bot state owned by the v3 movement/reaction runtime."""
+
+    cached_movement_plan: Any
+    action_hidden: Any
+    last_movement_tick: int = -1
+    movement_plan: MovementPlanV1 | None = None
+
+
+class MovementRuntimeServiceV3:
+    """16 Hz stateless movement refresh plus 128 Hz reaction inference."""
+
+    MOVEMENT_REFRESH_TICKS = 8
+    ACTION_HZ = 128.0
+    STALE_FALLBACK_SECONDS = 0.375
+
+    def __init__(
+        self,
+        *,
+        movement_session: Any | None = None,
+        action_session: Any | None = None,
+        movement_model_path: str | Path | None = None,
+        action_model_path: str | Path | None = None,
+        max_bots: int = MAX_BOTS,
+        tick_deadline_ms: float = 1000.0 / 128.0,
+        transport: Any | None = None,
+    ) -> None:
+        if not 1 <= int(max_bots) <= MAX_BOTS:
+            raise ValueError(f"max_bots must be between 1 and {MAX_BOTS}")
+        if movement_session is not None and movement_model_path is not None:
+            raise ValueError("provide movement_session or movement_model_path, not both")
+        if action_session is not None and action_model_path is not None:
+            raise ValueError("provide action_session or action_model_path, not both")
+        self._np = __import__("numpy")
+        if movement_session is None:
+            movement_session = self._load_cpu_session(movement_model_path, "movement_model_path")
+        if action_session is None:
+            action_session = self._load_cpu_session(action_model_path, "action_model_path")
+        self.movement_session = movement_session
+        self.action_session = action_session
+        self.max_bots = int(max_bots)
+        self.tick_deadline_ms = float(tick_deadline_ms)
+        if not math.isfinite(self.tick_deadline_ms) or self.tick_deadline_ms <= 0.0:
+            raise ValueError("tick_deadline_ms must be finite and positive")
+        self.transport = transport
+        self._movement_input_names = tuple(item.name for item in movement_session.get_inputs())
+        self._movement_output_names = tuple(item.name for item in movement_session.get_outputs())
+        self._action_input_names = tuple(item.name for item in action_session.get_inputs())
+        self._action_output_names = tuple(item.name for item in action_session.get_outputs())
+        if self._movement_input_names != ("observation",):
+            raise ValueError("v3 movement session must expose observation input")
+        if self._action_input_names != ("local_observation", "movement_plan", "action_hidden"):
+            raise ValueError("v3 action session has an invalid input contract")
+        self._states = [self._new_state() for _ in range(self.max_bots)]
+        self._last_tick = -1
+        self._movement_latency_ms: list[float] = []
+        self._reaction_latency_ms: list[float] = []
+        self._refresh_tick_latency_ms: list[float] = []
+        self._movement_fallback_count = 0
+        self._queue_full_fallback_count = 0
+        self._reaction_failure_count = 0
+        self._deadline_miss_count = 0
+
+    @staticmethod
+    def _load_cpu_session(model_path: str | Path | None, name: str) -> Any:
+        if model_path is None:
+            raise ValueError(f"{name} is required when a session is not supplied")
+        try:
+            import onnxruntime as ort
+        except ImportError as error:  # pragma: no cover - dependency boundary
+            raise RuntimeError("onnxruntime is required for v3 runtime") from error
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session = ort.InferenceSession(
+            str(Path(model_path)),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        providers = tuple(session.get_providers()) if hasattr(session, "get_providers") else ()
+        if providers and providers != ("CPUExecutionProvider",):
+            raise RuntimeError("v3 runtime must use CPU ONNX sessions")
+        return session
+
+    def _new_state(self) -> MovementRuntimeStateV3:
+        zeros = self._np.zeros
+        empty_plan = MovementPlanV1(
+            move=(0, 0, 0),
+            stance=(0, 0, 0),
+            jump=(0, 0, 0),
+            plan_embedding=(0.0,) * 75,
+        )
+        return MovementRuntimeStateV3(
+            cached_movement_plan=zeros((75,), dtype=self._np.float32),
+            action_hidden=zeros((384,), dtype=self._np.float32),
+            movement_plan=empty_plan,
+        )
+
+    @classmethod
+    def from_package(cls, package: Any, **kwargs: Any) -> Any:
+        return runtime_for_package(package, **kwargs)
+
+    def bot_state(self, slot: int) -> MovementRuntimeStateV3:
+        if not 0 <= int(slot) < self.max_bots:
+            raise IndexError(f"bot slot must be between 0 and {self.max_bots - 1}")
+        return self._states[int(slot)]
+
+    def _reset_states(self) -> None:
+        self._states = [self._new_state() for _ in range(self.max_bots)]
+        self._last_tick = -1
+
+    def reset_round(self) -> None:
+        self._reset_states()
+
+    def begin_round(self) -> None:
+        self.reset_round()
+
+    def change_side(self) -> None:
+        self._reset_states()
+
+    def end_match(self) -> None:
+        self._reset_states()
+
+    def backup_state(self) -> list[MovementRuntimeStateV3]:
+        import copy
+
+        return copy.deepcopy(self._states)
+
+    def restore_backup(self, backup: Sequence[MovementRuntimeStateV3]) -> None:
+        import copy
+
+        if len(backup) != self.max_bots:
+            raise ValueError("v3 runtime backup does not match max_bots")
+        self._states = copy.deepcopy(list(backup))
+
+    @staticmethod
+    def _plan_from_outputs(output: Mapping[str, Any], index: int) -> MovementPlanV1:
+        try:
+            move = tuple(int(value) for value in output["move_logits"][index].argmax(axis=-1).tolist())
+            stance = tuple(int(value) for value in output["stance_logits"][index].argmax(axis=-1).tolist())
+            jump = tuple(int(value) for value in output["jump_logits"][index].argmax(axis=-1).tolist())
+            embedding = tuple(float(value) for value in output["plan_embedding"][index].tolist())
+        except (KeyError, AttributeError, IndexError, TypeError, ValueError) as error:
+            raise ValueError("movement session does not expose the v3 plan outputs") from error
+        return MovementPlanV1(move=move, stance=stance, jump=jump, plan_embedding=embedding)
+
+    def _refresh_movement(self, observations: Sequence[BotObservationV1], server_tick: int) -> bool:
+        if not observations:
+            return True
+        values = self._np.stack(
+            [
+                self._np.frombuffer(observation.to_bytes(), dtype=self._np.uint8).astype(self._np.float32)
+                / 255.0
+                for observation in observations
+            ]
+        )
+        started = time.perf_counter_ns()
+        try:
+            outputs = self.movement_session.run(None, {"observation": values})
+            output = dict(zip(self._movement_output_names, outputs))
+            plans = tuple(self._plan_from_outputs(output, index) for index in range(len(observations)))
+        except Exception:
+            self._movement_latency_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
+            return False
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        self._movement_latency_ms.append(elapsed_ms)
+        for index, plan in enumerate(plans):
+            state = self._states[index]
+            state.movement_plan = plan
+            state.cached_movement_plan = self._np.asarray(plan.plan_embedding, dtype=self._np.float32).copy()
+            state.last_movement_tick = int(server_tick)
+        return True
+
+    def _reaction_actions(
+        self,
+        observations: Sequence[BotObservationV1],
+        server_tick: int,
+    ) -> tuple[BotActionV1, ...]:
+        if not observations:
+            return ()
+        local_observation = self._np.stack(
+            [
+                self._np.frombuffer(observation.to_bytes(), dtype=self._np.uint8).astype(self._np.float32)
+                / 255.0
+                for observation in observations
+            ]
+        )
+        movement_plan = self._np.stack([state.cached_movement_plan for state in self._states[: len(observations)]])
+        action_hidden = self._np.stack([state.action_hidden for state in self._states[: len(observations)]])
+        feed = {
+            "local_observation": local_observation,
+            "movement_plan": movement_plan,
+            "action_hidden": action_hidden,
+        }
+        started = time.perf_counter_ns()
+        outputs = self.action_session.run(None, feed)
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        self._reaction_latency_ms.append(elapsed_ms)
+        output = dict(zip(self._action_output_names, outputs))
+        required = {
+            "mouse_loc",
+            "mouse_scale",
+            "mouse_mix_logits",
+            "button_logits",
+            "weapon_logits",
+            "buy_logits",
+            "next_hidden",
+        }
+        if not required.issubset(output):
+            raise ValueError("v3 action session does not expose all reaction outputs")
+        result: list[BotActionV1] = []
+        for index, state in enumerate(self._states[: len(observations)]):
+            reaction = _action_from_onnx_outputs(
+                (0.0, 0.0, 0.0, 0.0, 0.0),
+                output["button_logits"][index],
+                output["weapon_logits"][index],
+                output["buy_logits"][index],
+                server_tick=server_tick,
+                mouse_loc=output["mouse_loc"][index],
+                mouse_scale=output["mouse_scale"][index],
+                mouse_mix_logits=output["mouse_mix_logits"][index],
+                sample_distributions=False,
+            )
+            age_s = (
+                self.STALE_FALLBACK_SECONDS
+                if state.last_movement_tick < 0
+                else max(0.0, (server_tick - state.last_movement_tick) / self.ACTION_HZ)
+            )
+            decoded = decode_movement_plan(state.movement_plan or self._new_state().movement_plan, age_s=age_s)
+            if decoded.fallback:
+                self._movement_fallback_count += 1
+                result.append(valve_fallback_action(server_tick + 1))
+            else:
+                merged = merge_movement_and_reaction(decoded, reaction)
+                result.append(guard_friendly_fire(observations[index], merged))
+            state.action_hidden = self._np.asarray(output["next_hidden"][index], dtype=self._np.float32).copy()
+        return tuple(result)
+
+    def process_tick(
+        self,
+        observations: Sequence[BotObservationV1],
+        *,
+        server_tick: int,
+        important_events: Sequence[Any] = (),
+    ) -> tuple[BotActionV1, ...]:
+        if server_tick < 0:
+            raise ValueError("server_tick must be non-negative")
+        if self._last_tick >= 0 and server_tick <= self._last_tick:
+            raise ValueError("server_tick must advance monotonically")
+        if len(observations) > self.max_bots:
+            raise ValueError(f"runtime configured for at most {self.max_bots} bots")
+        normalized = tuple(BotObservationV1(value.to_bytes()) for value in observations)
+        started = time.perf_counter_ns()
+        refresh_due = bool(
+            normalized
+            and (
+                self._last_tick < 0
+                or server_tick % self.MOVEMENT_REFRESH_TICKS == 0
+                or bool(important_events)
+            )
+        )
+        if refresh_due:
+            refresh_started = time.perf_counter_ns()
+            if not self._refresh_movement(normalized, server_tick):
+                self._refresh_tick_latency_ms.append((time.perf_counter_ns() - refresh_started) / 1_000_000.0)
+            else:
+                self._refresh_tick_latency_ms.append((time.perf_counter_ns() - refresh_started) / 1_000_000.0)
+        try:
+            actions = self._reaction_actions(normalized, server_tick)
+        except Exception:
+            self._reaction_failure_count += 1
+            actions = tuple(valve_fallback_action(server_tick + 1) for _ in normalized)
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        if elapsed_ms > self.tick_deadline_ms:
+            self._deadline_miss_count += 1
+        self._last_tick = int(server_tick)
+        return actions
+
+    def process_observation_batch(self, batch: ObservationBatchV1 | bytes) -> ActionBatchV1:
+        if isinstance(batch, (bytes, bytearray)):
+            batch = ObservationBatchV1.unpack(bytes(batch))
+        if not isinstance(batch, ObservationBatchV1):
+            raise TypeError("v3 runtime requires ObservationBatchV1")
+        if self.transport is not None and hasattr(self.transport, "refresh_epoch"):
+            current_epoch = int(self.transport.refresh_epoch())
+            if current_epoch != batch.epoch:
+                self.reset_round()
+                raise ValueError(f"epoch mismatch: expected {current_epoch}, got {batch.epoch}")
+        actions = self.process_tick(
+            tuple(BotObservationV1(value) for value in batch.observations),
+            server_tick=batch.server_tick,
+        )
+        result = ActionBatchV1(
+            epoch=batch.epoch,
+            server_tick=batch.server_tick,
+            actions=actions,
+            write_sequence=batch.write_sequence,
+        )
+        if self.transport is None:
+            return result
+        try:
+            self.transport.publish_action(result)
+        except QueueFull:
+            self._queue_full_fallback_count += 1
+            return ActionBatchV1(
+                epoch=batch.epoch,
+                server_tick=batch.server_tick,
+                actions=tuple(valve_fallback_action(batch.server_tick + 1) for _ in actions),
+                write_sequence=batch.write_sequence,
+            )
+        return result
+
+    @staticmethod
+    def _percentiles(values: Sequence[float]) -> dict[str, float]:
+        if not values:
+            return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+        p50, p95, p99 = __import__("numpy").percentile(
+            __import__("numpy").asarray(values, dtype=__import__("numpy").float64),
+            [50, 95, 99],
+        )
+        return {"p50": float(p50), "p95": float(p95), "p99": float(p99)}
+
+    def metrics(self) -> dict[str, Any]:
+        ages = [
+            self.STALE_FALLBACK_SECONDS
+            if state.last_movement_tick < 0 or self._last_tick < 0
+            else max(0.0, (self._last_tick - state.last_movement_tick) / self.ACTION_HZ)
+            for state in self._states
+        ]
+        return {
+            "movement_latency_ms": self._percentiles(self._movement_latency_ms),
+            "reaction_latency_ms": self._percentiles(self._reaction_latency_ms),
+            "refresh_tick_latency_ms": self._percentiles(self._refresh_tick_latency_ms),
+            "stale_plan_age_s": float(max(ages, default=0.0)),
+            "movement_fallback_count": self._movement_fallback_count,
+            "queue_full_fallback_count": self._queue_full_fallback_count,
+            "reaction_failure_count": self._reaction_failure_count,
+            "deadline_miss_count": self._deadline_miss_count,
+        }
+
+
+def runtime_for_package(package: Any, **kwargs: Any) -> Any:
+    """Select the runtime strictly from the package schema and lineage type."""
+
+    if isinstance(package, HierarchicalPackageV3):
+        resolved = dict(kwargs)
+        if "movement_session" not in resolved and "movement_model_path" not in resolved:
+            resolved["movement_model_path"] = package.movement_path
+        if "action_session" not in resolved and "action_model_path" not in resolved:
+            resolved["action_model_path"] = package.action_path
+        return MovementRuntimeServiceV3(
+            **resolved,
+        )
+    if isinstance(package, HierarchicalPackageV2):
+        resolved = dict(kwargs)
+        if "decision_session" not in resolved and "decision_model_path" not in resolved:
+            resolved["decision_model_path"] = package.decision_path
+        if "action_session" not in resolved and "action_model_path" not in resolved:
+            resolved["action_model_path"] = package.action_path
+        return HierarchicalRuntimeService(
+            **resolved,
+        )
+    raise TypeError("runtime package must be HierarchicalPackageV2 or HierarchicalPackageV3")
 
 
 class HierarchicalSharedMemoryRuntimeV1:

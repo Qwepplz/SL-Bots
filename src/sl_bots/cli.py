@@ -34,6 +34,7 @@ _COMMANDS: tuple[Command, ...] = (
     ("train", "test-pipeline"),
     ("probe", "capacity"),
     ("probe", "timescale"),
+    ("evaluate", "movement-ablation"),
     ("export",),
     ("runtime", "serve"),
 )
@@ -188,6 +189,13 @@ def _add_leaf(
         parser.add_argument("--epoch", type=int, default=1)
         parser.add_argument("--capacity", type=int, default=64)
         parser.add_argument("--max-bots", type=int, default=10)
+    elif command == ("evaluate", "movement-ablation"):
+        parser.add_argument("--predictions", type=Path, required=True)
+        parser.add_argument("--split-manifest", type=Path, required=True)
+        parser.add_argument("--test-split", type=Path)
+        parser.add_argument("--output", type=Path)
+        parser.add_argument("--seeds", default="7,17,29")
+        parser.add_argument("--phase", choices=["tuning", "final"], default="final")
     return parser
 
 
@@ -217,6 +225,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe_sub = probe.add_subparsers(dest="operation", required=True)
     _add_leaf(probe_sub, ("probe", "capacity"))
     _add_leaf(probe_sub, ("probe", "timescale"))
+
+    evaluate = top.add_parser("evaluate", help="离线评估与消融")
+    evaluate_sub = evaluate.add_subparsers(dest="operation", required=True)
+    _add_leaf(evaluate_sub, ("evaluate", "movement-ablation"))
 
     _add_leaf(top, ("export",))
 
@@ -1036,6 +1048,55 @@ def _run_test_pipeline(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "accepted-test-only" else 1
 
 
+def _run_movement_ablation(args: argparse.Namespace) -> int:
+    from .movement_evaluation import SingleReadTestSplitV1, evaluate_movement_ablation
+
+    try:
+        split_manifest = json.loads(args.split_manifest.read_text(encoding="utf-8"))
+        prediction_payload = json.loads(args.predictions.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("movement ablation inputs must be readable JSON") from error
+    if not isinstance(split_manifest, Mapping) or not isinstance(prediction_payload, Mapping):
+        raise ValueError("movement ablation inputs must be JSON objects")
+    experiment_records = prediction_payload.get("experiments", prediction_payload)
+    if not isinstance(experiment_records, Mapping):
+        raise ValueError("predictions JSON must contain an experiments object")
+    raw_seed_reports = prediction_payload.get("seed_reports")
+    if raw_seed_reports is not None and not isinstance(raw_seed_reports, Mapping):
+        raise ValueError("predictions JSON seed_reports must be an object")
+    try:
+        seeds = tuple(int(item.strip()) for item in str(args.seeds).split(",") if item.strip())
+    except ValueError as error:
+        raise ValueError("--seeds must be a comma-separated list of integers") from error
+    test_split = None
+    if args.test_split is not None:
+        try:
+            raw_test_split = json.loads(args.test_split.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("--test-split must point to readable JSON") from error
+        if not isinstance(raw_test_split, list):
+            raise ValueError("--test-split JSON must contain a list of records")
+        test_split = SingleReadTestSplitV1(raw_test_split)
+    report = evaluate_movement_ablation(
+        {str(key): value for key, value in experiment_records.items()},
+        split_manifest=split_manifest,
+        seeds=seeds,
+        test_split=test_split,
+        phase=args.phase,
+        train_prior_baseline=prediction_payload.get("train_prior_baseline"),
+        architecture_baseline=prediction_payload.get("architecture_baseline"),
+        seed_reports=(
+            {int(seed): report for seed, report in raw_seed_reports.items()}
+            if raw_seed_reports is not None
+            else None
+        ),
+    )
+    output = args.output or args.data_root / "reports" / "movement-ablation.json"
+    _write_json(output, report)
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _run_export(args: argparse.Namespace) -> int:
     from .export import export_actor
     from .training_bc import TrainingRunManifestV1
@@ -1107,6 +1168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_test_pipeline(args)
         if command == ("probe", "capacity") or command == ("probe", "timescale"):
             return _run_probe(args)
+        if command == ("evaluate", "movement-ablation"):
+            return _run_movement_ablation(args)
         if command == ("export",):
             return _run_export(args)
         if command == ("runtime", "serve"):

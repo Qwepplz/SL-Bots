@@ -1,0 +1,37 @@
+schema: movement-policy-v3
+purpose: test_only
+
+observation:
+  payload_bytes: 256
+  token_shape: [44, 32]
+
+movement:
+  horizons_s: [0.0, 0.125, 0.25]
+  direction_count: 16
+  move_classes: 17
+  stance_names: [run, walk, crouch]
+  jump_classes: 2
+  plan_embedding_size: 75
+  token_width: 256
+  layers: 4
+  heads: 1
+  ffn_width: 2048
+  dropout: 0.0
+
+action:
+  hidden_size: 384
+  plan_embedding_size: 75
+  frequency_hz: 128
+
+training:
+  movement_learning_rate: 0.00004
+  weight_decay: 0.0001
+  physical_batch_size: 128
+  gradient_accumulation: 8
+  seeds: [7, 17, 29]
+  purpose: test_only
+
+gates:
+  max_deadline_ms: 7.8125
+  int8_max_metric_drop: 0.01
+  stale_plan_fallback_s: 0.375

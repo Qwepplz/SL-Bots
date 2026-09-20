@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .contracts import DataPurpose, HierarchicalPackageV2, ensure_purpose
+from .contracts import (
+    DataPurpose,
+    HierarchicalPackageV2,
+    HierarchicalPackageV3,
+    MOVEMENT_STATE_SCHEMA_V3,
+    ensure_purpose,
+)
 from .lineage import DatasetManifestV1, ProductionLineageError
 from .model import RecurrentStateV1, MirageActor
 
@@ -677,6 +683,112 @@ def export_hierarchical_package(
     return package
 
 
+def export_hierarchical_package_v3(
+    run_manifest: Any,
+    output_dir: str | Path,
+    purpose: DataPurpose | str,
+    *,
+    movement_model: Any,
+    action_model: Any,
+    generation: int = 0,
+    parent_generation: int | None = None,
+    metrics: Mapping[str, Any] | None = None,
+) -> HierarchicalPackageV3:
+    """Export a test-only v3 movement/reaction pair after the offline gate."""
+
+    target = ensure_purpose(purpose)
+    if target is not DataPurpose.TEST_ONLY:
+        raise ProductionLineageError("movement v3 package export is test_only only")
+    if not hasattr(run_manifest, "assert_exportable"):
+        raise TypeError("run_manifest must expose assert_exportable")
+    run_manifest.assert_exportable(target)
+    if ensure_purpose(getattr(run_manifest, "purpose", target)) is not DataPurpose.TEST_ONLY:
+        raise ProductionLineageError("movement v3 package lineage must be test_only")
+
+    run_metrics = getattr(run_manifest, "metrics", {})
+    export_metrics = dict(metrics or {})
+    offline_gate_passed = bool(
+        (run_metrics.get("offline_gate_passed", False) if isinstance(run_metrics, Mapping) else False)
+        or export_metrics.get("offline_gate_passed", False)
+    )
+    if not offline_gate_passed:
+        raise ValueError("movement v3 package export requires offline gate evidence")
+
+    from .quantization import (
+        contains_fake_quant,
+        export_movement_int8,
+        export_reactive_action_fp32,
+        prepare_action_fp32,
+        validate_movement_int8_graph,
+        validate_reactive_action_fp32_graph,
+    )
+
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    movement = copy.deepcopy(movement_model).cpu()
+    action = copy.deepcopy(action_model).cpu()
+    if not contains_fake_quant(movement):
+        raise ValueError(
+            "movement v3 package export requires a movement model trained with QAT; "
+            "export-time fake-quant preparation is not accepted"
+        )
+    prepare_action_fp32(action)
+    movement_path = destination / "movement.int8.onnx"
+    action_path = destination / "action.fp32.onnx"
+    export_movement_int8(movement, movement_path)
+    export_reactive_action_fp32(action, action_path)
+    movement_report = validate_movement_int8_graph(movement_path)
+    action_report = validate_reactive_action_fp32_graph(action_path)
+    training_dataset = getattr(run_manifest, "dataset_manifest", None)
+    training_lineage = (
+        _manifest_to_dict(training_dataset)
+        if isinstance(training_dataset, DatasetManifestV1)
+        else {"purpose": DataPurpose.TEST_ONLY.value}
+    )
+    package_metrics = _json_safe(
+        {
+            "movement_graph": movement_report,
+            "action_graph": action_report,
+            "offline_gate_passed": True,
+            **export_metrics,
+        }
+    )
+    package = HierarchicalPackageV3(
+        generation=generation,
+        parent_generation=parent_generation,
+        movement_path=movement_path,
+        action_path=action_path,
+        purpose=target,
+        movement_sha256=_sha256_file(movement_path),
+        action_sha256=_sha256_file(action_path),
+        state_schema=MOVEMENT_STATE_SCHEMA_V3,
+        movement_parameter_count=sum(parameter.numel() for parameter in movement.parameters()),
+        action_parameter_count=sum(parameter.numel() for parameter in action.parameters()),
+        metadata={
+            "purpose": target.value,
+            "training_lineage": training_lineage,
+            "training_run": {
+                "name": getattr(run_manifest, "name", ""),
+                "steps": getattr(run_manifest, "steps", None),
+                "config_sha256": getattr(run_manifest, "config_sha256", ""),
+                "checkpoint_path": str(getattr(run_manifest, "checkpoint_path", "")),
+            },
+            "movement_qat_proven": True,
+            "metrics": package_metrics,
+        },
+    )
+    package.assert_loadable()
+    (destination / "package-v3.json").write_text(
+        json.dumps(package.to_dict(), ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    (destination / "metrics.json").write_text(
+        json.dumps(package_metrics, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    return package
+
+
 def load_hierarchical_package(manifest_path: str | Path) -> HierarchicalPackageV2:
     manifest = Path(manifest_path)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -688,6 +800,21 @@ def load_hierarchical_package(manifest_path: str | Path) -> HierarchicalPackageV
         if not path.is_absolute():
             payload[key] = str((manifest.parent / path).resolve())
     package = HierarchicalPackageV2.from_dict(payload)
+    package.assert_loadable()
+    return package
+
+
+def load_hierarchical_package_v3(manifest_path: str | Path) -> HierarchicalPackageV3:
+    manifest = Path(manifest_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("movement v3 package manifest must be a JSON object")
+    payload = dict(payload)
+    for key in ("movement_path", "action_path"):
+        path = Path(payload[key])
+        if not path.is_absolute():
+            payload[key] = str((manifest.parent / path).resolve())
+    package = HierarchicalPackageV3.from_dict(payload)
     package.assert_loadable()
     return package
 
@@ -709,5 +836,31 @@ def publish_hierarchical_package(
     payload = package.to_dict()
     payload["pointer_slot"] = slot
     temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    os.replace(temporary, pointer)
+    return pointer
+
+
+def publish_hierarchical_package_v3(
+    package: HierarchicalPackageV3,
+    pointer_path: str | Path,
+    *,
+    slot: str,
+) -> Path:
+    """Publish v3 only to pending, leaving the v2 active pointer untouched."""
+
+    if slot != "pending":
+        raise ValueError("movement v3 package can only be published to pending")
+    if not isinstance(package, HierarchicalPackageV3):
+        raise TypeError("movement v3 publisher requires HierarchicalPackageV3")
+    package.assert_loadable()
+    pointer = Path(pointer_path)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    temporary = pointer.with_suffix(pointer.suffix + ".tmp")
+    payload = package.to_dict()
+    payload["pointer_slot"] = slot
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
     os.replace(temporary, pointer)
     return pointer
